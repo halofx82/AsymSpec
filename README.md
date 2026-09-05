@@ -2,11 +2,10 @@
 
 This is a derived work based on the original **AsymSpec:
 Context-Asymmetric Speculative Decoding for Agentic LLMs** (EMNLP 2026)
-reference repository in the sibling [`../AsymSpec`](../AsymSpec) checkout.
+reference implementation of [AsymSpec](https://github.com/USTC-StarTeam/AsymSpec.git).
 It ports that implementation from vLLM 0.19.0 to vLLM 0.28.0; it is not the
 original or official release.
-See [PORTING.md](PORTING.md) for provenance, validation status, and the
-4×RTX 3090 acceptance command. The original 0.19.0 checkout is unchanged.
+See [PORTING.md](PORTING.md) for provenance, and validation status.
 
 Associated paper: [arXiv:2608.26004](https://arxiv.org/abs/2608.26004)
 
@@ -171,8 +170,48 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/chat_specsteer.py \
 provide its corresponding concise summary with `--main-context-file` for the
 verifier/compressed path. Without files, the full path retains all chat turns,
 while the compressed path retains the newest complete turns that fit. Use
-`/reset` to clear history and `/quit` to exit. This is a terminal interface:
-stock vLLM's OpenAI server cannot carry the required second prompt stream.
+`/reset` to clear history and `/quit` to exit.
+
+### OpenAI-compatible server
+
+After deployment, ordinary `vllm serve` transparently derives the full drafter
+prompt and a recent-history compressed prompt from a standard Chat Completions
+request. The compressed prompt's usage accounting is reported by vLLM as
+`usage.prompt_tokens`.
+
+```bash
+export ASYMSPEC_METHOD=jsd
+export ASYMSPEC_DELTA_SRC=ours
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-32B \
+  --served-model-name qwen3-32b-asymspec --dtype bfloat16 --trust-remote-code \
+  --tensor-parallel-size 4 --max-model-len 40960 --gpu-memory-utilization 0.97 \
+  --max-num-batched-tokens 16384 --no-enable-prefix-caching --enforce-eager \
+  --generation-config vllm --speculative-config '{
+    "method": "specsteer", "model": "Qwen/Qwen3-4B",
+    "num_speculative_tokens": 2, "draft_tensor_parallel_size": 4,
+    "specsteer_beta": 1.0, "specsteer_gamma": 0.5,
+    "specsteer_main_max_model_len": 8192,
+    "specsteer_context_strategy": "recent"
+  }'
+```
+
+Use the normal OpenAI endpoint; no `vllm_xargs` or AsymSpec request fields are
+needed. `system` and `developer` messages at the start remain pinned, and the
+newest complete user/tool interactions that fit are kept for the compressed
+view. Multimodal requests are currently rejected only for SpecSteer serving.
+The server owns `specsteer_aug_prompt_ids`; clients may not supply that key.
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3-32b-asymspec",
+    "messages": [{"role": "user", "content": "Explain why the sky is blue."}],
+    "temperature": 0,
+    "max_tokens": 256
+  }'
+```
 
 Run the dependency-light release checks with:
 

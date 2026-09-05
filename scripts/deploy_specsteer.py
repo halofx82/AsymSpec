@@ -53,13 +53,26 @@ def apply(pkg, backup):
     if state is None:
         state = {"package": str(pkg), "original": {}, "deployed": {}}
         backup.mkdir(parents=True, exist_ok=True)
-        for src, dst, entry in pairs:
-            rel = entry["target"]
-            state["original"][rel] = sha256(dst)
-            if dst.exists():
-                saved = backup / "original" / rel
-                saved.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dst, saved)
+    # A payload can gain files after an earlier deployment. Record their
+    # originals before copying so --revert remains complete and safe.
+    added_originals = False
+    for src, dst, entry in pairs:
+        rel = entry["target"]
+        if rel in state["original"]:
+            continue
+        current = sha256(dst)
+        if current != entry["upstream_sha256"]:
+            raise RuntimeError(
+                "Cannot add a new payload entry after it has already been "
+                f"modified; restore the upstream file first: {dst}"
+            )
+        state["original"][rel] = current
+        if dst.exists():
+            saved = backup / "original" / rel
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dst, saved)
+        added_originals = True
+    if added_originals:
         state_path.write_text(json.dumps(state, indent=2) + "\n")
     try:
         for src, dst, entry in pairs:

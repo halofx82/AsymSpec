@@ -311,6 +311,8 @@ class SpeculativeConfig:
     the global model length for every path.  The global limit always remains
     the full-context drafter limit.
     """
+    specsteer_context_strategy: str = "recent"
+    """Server-side compressed-context strategy for SpecSteer chat serving."""
 
     def compute_hash(self) -> str:
         """
@@ -336,6 +338,7 @@ class SpeculativeConfig:
         factors.append(uses_aux_hidden_states)
         # This controls AsymSpec KV tensor and block-table shapes.
         factors.append(self.specsteer_main_max_model_len)
+        factors.append(self.specsteer_context_strategy)
 
         if uses_aux_hidden_states and self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1358,6 +1361,9 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.specsteer_context_strategy != "recent":
+            raise ValueError(
+                "specsteer_context_strategy currently supports only 'recent'.")
         if self.specsteer_main_max_model_len is not None:
             if self.method != "specsteer":
                 raise ValueError(

@@ -41,6 +41,16 @@
       "source": "specsteer_sampler.py",
       "target": "v1/sample/specsteer_sampler.py",
       "upstream_sha256": null
+    },
+    {
+      "source": "asymspec_serving.py",
+      "target": "entrypoints/openai/chat_completion/asymspec_serving.py",
+      "upstream_sha256": null
+    },
+    {
+      "source": "serving.py",
+      "target": "entrypoints/openai/chat_completion/serving.py",
+      "upstream_sha256": "a2440b6b76ad87de86bcf6fc7061ad5d02ab67c1c3c89ca7de3eeb29aa12aa2f"
     }
   ]
 }
