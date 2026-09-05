@@ -51,7 +51,9 @@ def compressed_messages(
     fixed: list[dict[str, str]] = []
     add_context(fixed, system, "System instructions:")
     add_context(fixed, main_context, "Compressed reference context:")
-    if len(prompt_ids(tokenizer, fixed)) > token_budget:
+    # Qwen's template rejects an empty conversation.  Defer the capacity
+    # check until the first actual user/assistant message is present.
+    if fixed and len(prompt_ids(tokenizer, fixed)) > token_budget:
         raise ValueError("system prompt and --main-context-file exceed compressed capacity")
 
     kept_reversed: list[dict[str, str]] = []
