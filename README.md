@@ -8,7 +8,7 @@ original or official release.
 See [PORTING.md](PORTING.md) for provenance, validation status, and the
 4×RTX 3090 acceptance command. The original 0.19.0 checkout is unchanged.
 
-Paper: [arXiv:2608.26004](https://arxiv.org/abs/2608.26004)
+Associated paper: [arXiv:2608.26004](https://arxiv.org/abs/2608.26004)
 
 AsymSpec lets a lightweight drafter read the full context while the large
 verifier operates on a compressed view. A same-model cross-context signal,
@@ -17,11 +17,11 @@ rejection. Context-Divergence Acceptance (CDA) uses
 `gamma_eff = gamma * exp(-JSD)` to relax acceptance when the two context
 views disagree.
 
-## Release status
+## Derived-work status
 
-This repository is a clean release candidate prepared from the authors'
-collaborative research code. It intentionally excludes private Git history,
-raw outputs, cached web/tool responses, model weights, and datasets. See
+This separate port is maintained independently of the original authors and
+reference repository. It intentionally excludes private Git history, raw
+outputs, cached web/tool responses, model weights, and datasets. See
 [`RELEASE_PROVENANCE.md`](RELEASE_PROVENANCE.md) for attribution and source
 provenance.
 
@@ -30,11 +30,11 @@ provenance.
 ```text
 vllm_specsteer/              AsymSpec patches for vLLM 0.28.0
 scripts/deploy_specsteer.py  Patch deployment and rollback helper
-scripts/bench_*.py           Paper benchmark harnesses
+scripts/bench_*.py           Benchmark harnesses adapted from the reference repo
 scripts/asym_smolagents/     GAIA and SimpleQA agentic harnesses
 experiments/                 Compression and portability utilities
 experiments/cross_family/    Qwen--Llama portability implementation
-configs/paper.yaml           Camera-ready default configurations
+configs/paper.yaml           Configurations reproduced from the paper setup
 ```
 
 `specsteer` is retained in a few internal file and class names as a legacy
@@ -105,12 +105,12 @@ Restore the original vLLM files with:
 python scripts/deploy_specsteer.py --revert
 ```
 
-## Paper defaults
+## Original-paper defaults
 
-The camera-ready defaults are greedy decoding, `beta=1.0`, `gamma=0.5`, and
-CDA via `--asym_method jsd`. Text and agentic benchmarks use `K=2`;
-MathVista is the cross-modal exception and uses `K=4`. Exact settings are in
-[`configs/paper.yaml`](configs/paper.yaml).
+The original paper's camera-ready defaults are greedy decoding, `beta=1.0`,
+`gamma=0.5`, and CDA via `--asym_method jsd`. Text and agentic benchmarks use
+`K=2`; MathVista is the cross-modal exception and uses `K=4`. The port's
+reproduced settings are in [`configs/paper.yaml`](configs/paper.yaml).
 
 Representative commands:
 
@@ -151,10 +151,10 @@ python scripts/bench_mathvista.py --cfg ss --K 4 --beta 1.0 \
   --gamma 0.5 --asym_method jsd --n 0 --tag paper
 ```
 
-The agentic entry points are
+The adapted agentic entry points are
 `scripts/asym_smolagents/run_gaia_web.py` and
-`scripts/asym_smolagents/run_simpleqa.py`. Their defaults match
-the paper: CDA via `jsd`, LLMLingua-2 ratio 0.3, two recent turns retained,
+`scripts/asym_smolagents/run_simpleqa.py`. Their defaults reproduce the
+paper setup: CDA via `jsd`, LLMLingua-2 ratio 0.3, two recent turns retained,
 and `K=2`.
 
 ## Interactive chat
@@ -201,14 +201,14 @@ python experiments/cross_family/bench_lb_crossfamily.py \
 
 ## Data and credentials
 
-No model weights, benchmark datasets, generated responses, API keys, or
-cached tool results are distributed in this repository. Users must accept
-and follow each upstream model and dataset license. Do not commit `.env` or
-`conf.yaml`.
+This derived checkout contains no model weights, benchmark datasets, generated
+responses, API keys, or cached tool results. Users must accept and follow each
+upstream model and dataset license. Do not commit `.env` or `conf.yaml`.
 
 ## Citation
 
-Please cite the paper using [`CITATION.cff`](CITATION.cff).
+Citation information for the associated paper is in
+[`CITATION.cff`](CITATION.cff).
 
 ## License
 
