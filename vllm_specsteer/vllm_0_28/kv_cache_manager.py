@@ -203,7 +203,8 @@ class KVCacheManager:
         Returns:
             The KV cache usage (between 0.0 and 1.0).
         """
-        return self.block_pool.get_usage()
+        get_usage = getattr(self.coordinator, "get_usage", None)
+        return get_usage() if get_usage is not None else self.block_pool.get_usage()
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -448,6 +449,25 @@ class KVCacheManager:
             aug = extra.get("specsteer_aug_prompt_ids")
             self.coordinator.aug_offsets[request.request_id] = (
                 len(aug) - request.num_prompt_tokens if aug else 0)
+            if getattr(self.coordinator, "has_asymmetric_pools", False):
+                limits = self.kv_cache_config.max_model_len_per_group
+                drafter_gid = next(iter(self.coordinator.drafter_gids))
+                main_gid = next(i for i in range(len(limits))
+                                if i not in self.coordinator.drafter_gids)
+                main_total = request.num_prompt_tokens + request.max_tokens
+                full_total = (len(aug) if aug else request.num_prompt_tokens)
+                full_total += request.max_tokens
+                if main_total > limits[main_gid]:
+                    raise ValueError(
+                        "AsymSpec compressed context exceeds "
+                        "specsteer_main_max_model_len: "
+                        f"{request.num_prompt_tokens} prompt + "
+                        f"{request.max_tokens} generation > {limits[main_gid]}")
+                if full_total > limits[drafter_gid]:
+                    raise ValueError(
+                        "AsymSpec full context exceeds max_model_len: "
+                        f"{len(aug) if aug else request.num_prompt_tokens} prompt + "
+                        f"{request.max_tokens} generation > {limits[drafter_gid]}")
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
@@ -494,9 +514,23 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
-                return None
+            if getattr(self.coordinator, "has_asymmetric_pools", False):
+                if not self.coordinator.can_allocate(
+                    request_id=request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                    watermark_blocks=watermark_blocks,
+                ):
+                    return None
+            else:
+                required_blocks = num_blocks_to_allocate + watermark_blocks
+                if required_blocks > self.block_pool.get_num_free_blocks():
+                    return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
@@ -531,11 +565,26 @@ class KVCacheManager:
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
-            # Cannot allocate new blocks
-            return None
+        if getattr(self.coordinator, "has_asymmetric_pools", False):
+            if not self.coordinator.can_allocate(
+                request_id=request.request_id,
+                num_tokens=num_tokens_need_slot,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=(num_local_computed_tokens
+                                       + num_external_computed_tokens),
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+                reserved_blocks=reserved_blocks,
+                watermark_blocks=watermark_blocks,
+            ):
+                return None
+        else:
+            available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+            required_blocks = num_blocks_to_allocate + watermark_blocks
+            if required_blocks > available_blocks:
+                # Cannot allocate new blocks
+                return None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks

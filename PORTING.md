@@ -1,7 +1,7 @@
 # vLLM 0.28.0 port
 
-Status: implementation and GPU validation in progress. Do not interpret
-source deployment or CPU tests as a runtime-parity claim.
+Status: asymmetric KV allocation and single-load 4B sharing are implemented
+and validated on four RTX 3090 GPUs.
 
 ## Provenance and environment
 
@@ -34,9 +34,19 @@ caches and output paths are isolated under this checkout.
   layer names. Allocation prediction and allocation apply the same full-context
   offset in the scheduler process; workers reconstruct image/context metadata
   from transported request state. Completion and preemption invalidate state.
-- The two drafter views retain separate module and attention objects but alias
-  their identical frozen parameter storage. This preserves independent KV
-  caches while recovering one drafter copy per TP rank for the 24 GiB budget.
+- The full-context drafter is checkpoint-loaded once. The compressed view is
+  constructed through vLLM's lower-level `initialize_model()` path on the meta
+  device, then every Parameter and registered buffer is rebound by qualified
+  name. Hard startup checks require identical layouts, object-identical state,
+  no meta/uninitialized tensors, and distinct attention registrations.
+- With `specsteer_main_max_model_len`, gid0 (32B verifier + compressed 4B) and
+  gid1 (full 4B drafter) receive separate physical tensor sizes and separate
+  BlockPools. Block IDs are group-local; worker block tables and attention
+  metadata already select a group before interpreting them. Prefix caching,
+  cache connectors, KV-cache events, deferred asynchronous frees,
+  mixed-precision zeroing, and Mamba are deliberately outside this isolated
+  path because their APIs flatten block IDs across groups. Omitting the option
+  keeps vLLM's shared pool.
 - AsymSpec uses synchronous scheduling, no prefix caching, full draft logits,
   and its existing optional heterogeneous-vocabulary extension. Upstream
   automatic vocabulary mapping is disabled for AsymSpec.
@@ -81,6 +91,32 @@ and output lengths 165, 233, and 229. It produced 627 tokens at 8.52 tokens/s
 with 0.8691 draft acceptance and no allocation failure. The earlier EOS and
 token streams differ from the 0.19 baseline after two common-prefix tokens;
 exact output identity is not an acceptance requirement across vLLM runtimes.
+
+The optimized zero-offload run used
+`--specsteer-main-max-model-len 8192`. It completed the same three requests
+and produced byte-identical token arrays and speculative counts to that
+pre-optimization 0.28 result: 627 tokens, AR 0.86910, MAL 2.73820, and
+per-position acceptance 0.91416 / 0.82403. Throughput was 15.20 tokens/s
+versus 8.54 tokens/s in the stored 2 GiB-offload run. Physical KV allocation
+was 1.63 GiB/rank: gid0 had 513 blocks (8,192 compressed tokens) and gid1 had
+1,537 blocks (24,576 full-context tokens).
+
+A capacity test then configured the native Qwen3 maximum of 40,960 with the
+compressed limit fixed at 8,192. The engine allocated 2.19 GiB/rank
+(gid0=513 blocks, gid1=2,561 blocks) and completed a real request containing
+40,928 full-context prompt tokens plus 16 generated tokens. No YaRN or other
+RoPE scaling was used. `scripts/check_context_capacity.py` reproduces this
+test; 40,960 is the maximum tested because it is the checkpoint's native
+context limit.
+
+The historical 0.19 artifact remains a cross-runtime comparison, not an exact
+semantic oracle for the 0.28 engine. A paired short trace showed that 0.19 and
+0.28 agree on the first two output tokens and initial model top-1 signals, then
+diverge; the 0.19 sample text becomes repetitive/malformed while 0.28 reaches
+EOS coherently. The optimization does not attempt to recreate that behavior:
+its strict regression oracle is the stored pre-optimization 0.28 token stream,
+which it preserves exactly. Consequently the older 0.19 figures (AR 0.96994,
+MAL 2.93989, 3,072 tokens) should not be reported as achieved by this port.
 
 `24576` is the total sequence limit, including generation. The harness reserves
 `max_new + 16` tokens when constructing inputs. The three actual prompt lengths

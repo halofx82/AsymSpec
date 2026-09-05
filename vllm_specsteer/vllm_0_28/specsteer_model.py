@@ -33,6 +33,73 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 logger = init_logger(__name__)
 
 
+def _module_and_leaf(root: nn.Module, qualified_name: str):
+    """Return the owning module and final registration name."""
+    parent_name, _, leaf = qualified_name.rpartition(".")
+    return (root.get_submodule(parent_name) if parent_name else root), leaf
+
+
+def _share_model_state(drafter: nn.Module, base: nn.Module) -> tuple[int, int]:
+    """Rebind ``base`` state to ``drafter`` without sharing module objects.
+
+    The base tree is constructed on the meta device, so this is also the only
+    materialization step for its parameters and buffers.  Keeping the trees
+    distinct preserves attention-layer names and independent KV identities.
+    """
+    # Keep duplicate registration names: tied embeddings/lm_head must retain
+    # the drafter's exact alias graph, not merely equivalent storage.
+    draft_params = dict(drafter.named_parameters(remove_duplicate=False))
+    base_params = dict(base.named_parameters(remove_duplicate=False))
+    if draft_params.keys() != base_params.keys():
+        mismatch = sorted(draft_params.keys() ^ base_params.keys())[:16]
+        raise RuntimeError(
+            "AsymSpec base/drafter parameter layouts differ: " + repr(mismatch))
+
+    parameter_bytes = 0
+    seen_parameters: set[int] = set()
+    for name, draft_param in draft_params.items():
+        parent, leaf = _module_and_leaf(base, name)
+        if id(draft_param) not in seen_parameters:
+            parameter_bytes += draft_param.numel() * draft_param.element_size()
+            seen_parameters.add(id(draft_param))
+        parent._parameters[leaf] = draft_param
+
+    draft_buffers = dict(drafter.named_buffers(remove_duplicate=False))
+    base_buffers = dict(base.named_buffers(remove_duplicate=False))
+    if draft_buffers.keys() != base_buffers.keys():
+        mismatch = sorted(draft_buffers.keys() ^ base_buffers.keys())[:16]
+        raise RuntimeError(
+            "AsymSpec base/drafter buffer layouts differ: " + repr(mismatch))
+
+    buffer_bytes = 0
+    seen_buffers: set[int] = set()
+    for name, draft_buffer in draft_buffers.items():
+        parent, leaf = _module_and_leaf(base, name)
+        if id(draft_buffer) not in seen_buffers:
+            buffer_bytes += draft_buffer.numel() * draft_buffer.element_size()
+            seen_buffers.add(id(draft_buffer))
+        parent._buffers[leaf] = draft_buffer
+
+    # These are intentionally hard failures: a partially materialized base
+    # model can survive startup and fail nondeterministically on first forward.
+    rebound_params = dict(base.named_parameters(remove_duplicate=False))
+    rebound_buffers = dict(base.named_buffers(remove_duplicate=False))
+    for name, draft_param in draft_params.items():
+        base_param = rebound_params[name]
+        if base_param is not draft_param:
+            raise RuntimeError(f"AsymSpec parameter was not shared: {name}")
+    for name, draft_buffer in draft_buffers.items():
+        base_buffer = rebound_buffers[name]
+        if base_buffer is not draft_buffer:
+            raise RuntimeError(f"AsymSpec buffer was not shared: {name}")
+    for name, tensor in (*rebound_params.items(), *rebound_buffers.items()):
+        if tensor.is_meta:
+            raise RuntimeError(f"AsymSpec left a meta tensor behind: {name}")
+        if isinstance(tensor, torch.nn.parameter.UninitializedParameter):
+            raise RuntimeError(f"AsymSpec left an uninitialized tensor: {name}")
+    return parameter_bytes, buffer_bytes
+
+
 def _install_drafter_gid_split_patch():
     # Scheduler integration is deployed in core/*.py. Only worker-local
     # caches live here; never delete another run's compilation cache.
@@ -335,9 +402,12 @@ class SpecSteerProposer(DraftModelProposer):
 
     @override
     def _get_model(self) -> nn.Module:
-        """Load BOTH drafter and base SLM — each via get_model with a distinct
-        prefix so their attention layers register under different names and
-        vLLM's KV cache manager can assign each its own paged cache pool.
+        """Load one SLM checkpoint and construct two distinct module trees.
+
+        The compressed/base tree is initialized structurally on ``meta`` and
+        then rebound to the drafter's Parameters and buffers.  Its attention
+        objects and prefix stay distinct, while checkpoint I/O and physical
+        parameter storage occur exactly once.
 
         The drafter is returned to satisfy the parent contract. The base
         instance is stashed in self.base_model and has its attn layers
@@ -345,7 +415,9 @@ class SpecSteerProposer(DraftModelProposer):
         """
         from vllm.compilation.backends import set_model_tag
         from vllm.model_executor.model_loader import get_model
+        from vllm.model_executor.model_loader.utils import initialize_model
         from vllm.model_executor.models import supports_multimodal  # noqa: F401
+        from vllm.utils.torch_utils import set_default_torch_dtype
 
         # Snapshot registered attn layer names BEFORE loading anything so
         # we can diff to figure out which belong to each newly loaded model.
@@ -360,41 +432,24 @@ class SpecSteerProposer(DraftModelProposer):
             )
         after_drafter_attn = set(self._all_attn_layer_names())
 
-        # 2. Base — same weights and config as drafter, but loaded as a
-        # DIFFERENT vLLM model instance under prefix="specsteer_base". Its
-        # attention layers register under that prefix, giving them a
-        # distinct KV cache pool from drafter's.
+        # 2. Base — construct the same architecture without touching the
+        # checkpoint or allocating a second set of model weights.
         with set_model_tag("specsteer_base"):
-            self.base_model = get_model(
-                vllm_config=draft_vllm_config,
-                prefix="specsteer_base",
-            )
-        # Both views use identical frozen weights. Keep distinct module and
-        # attention objects (and therefore distinct KV cache layer names), but
-        # alias parameter storage so the second view does not consume another
-        # drafter-sized allocation. This is required for the 4x24 GiB profile:
-        # three independent KV views need more memory than duplicate weights
-        # leave available. Parameter sharing is exact and gradients are off.
-        draft_params = dict(drafter.named_parameters())
-        base_params = dict(self.base_model.named_parameters())
-        if draft_params.keys() != base_params.keys():
-            missing = sorted(draft_params.keys() ^ base_params.keys())[:8]
-            raise RuntimeError(
-                "AsymSpec base/drafter parameter layouts differ: " + repr(missing))
-        shared_bytes = 0
-        for name, draft_param in draft_params.items():
-            parent = self.base_model
-            parts = name.split(".")
-            for part in parts[:-1]:
-                parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
-            base_param = parent._parameters[parts[-1]]
-            shared_bytes += base_param.numel() * base_param.element_size()
-            parent._parameters[parts[-1]] = draft_param
-        del base_params
-        torch.cuda.empty_cache()
+            with set_default_torch_dtype(draft_vllm_config.model_config.dtype):
+                with torch.device("meta"):
+                    self.base_model = initialize_model(
+                        vllm_config=draft_vllm_config,
+                        model_config=draft_vllm_config.model_config,
+                        prefix="specsteer_base",
+                    )
+        shared_bytes, shared_buffer_bytes = _share_model_state(
+            drafter, self.base_model)
+        self.base_model.eval()
         logger.info(
-            "AsymSpec: base view shares %.2f GiB of drafter parameter storage",
+            "AsymSpec: base view structurally initialized without checkpoint "
+            "I/O; sharing %.2f GiB parameters and %.2f MiB buffers",
             shared_bytes / (1024**3),
+            shared_buffer_bytes / (1024**2),
         )
         after_base_attn = set(self._all_attn_layer_names())
 

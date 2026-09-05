@@ -7530,6 +7530,9 @@ class GPUModelRunner(
         max_num_blocks = []
         slot_mapping_modes = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
+        per_group_max_lens = getattr(
+            kv_cache_config, "max_model_len_per_group", None)
+        logical_gid = 0
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
             kv_cache_spec_kind = get_kv_cache_spec_kind(kv_cache_spec)
@@ -7541,10 +7544,14 @@ class GPUModelRunner(
                 slot_mapping_modes.append(SlotMappingMode.NONE)
             else:
                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
+            group_max_len = (per_group_max_lens[logical_gid]
+                             if per_group_max_lens is not None
+                             else max_model_len)
             max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(
-                self.vllm_config, max_model_len
+                self.vllm_config, group_max_len
             )
             max_num_blocks.append(max_num_blocks_per_req)
+            logical_gid += 1
 
         if (
             block_sizes != self._init_block_sizes

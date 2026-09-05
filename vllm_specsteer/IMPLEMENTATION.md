@@ -125,7 +125,18 @@ SLM_base is registered in vLLM's spec-decode pipeline as a separate model with l
 - **base** (SLM_base): `gid=0` layers `specsteer_base.layers.N.*`, distinct from LLM
 - **verifier** (LLM): `gid=0` layers `model.layers.N.*`
 
-All three share vLLM's block-pool / page table machinery but write to different per-layer cache tensors, so reshape_and_cache writes never overlap.
+Without `specsteer_main_max_model_len`, both groups retain vLLM's legacy shared
+BlockPool. With the option set, each group has an independent BlockPool and
+group-local block IDs. The worker already indexes a block table by group before
+passing it to that group's attention layers, so IDs never cross pool boundaries.
+Every model layer has its own physical cache tensor sized from its group's block
+count; `reshape_and_cache` writes therefore never overlap.
+
+The compressed 4B module tree is created on the meta device with
+`initialize_model()` and never invokes a model loader. Parameters and buffers
+are rebound to the normally loaded drafter by every qualified registration
+name, including duplicate names needed to preserve tied-weight aliases. The
+attention objects remain distinct and are registered under `specsteer_base.*`.
 
 ### Per-step flow
 

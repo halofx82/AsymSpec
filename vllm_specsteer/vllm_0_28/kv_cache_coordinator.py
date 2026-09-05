@@ -922,6 +922,69 @@ class SpecSteerKVCacheCoordinator(KVCacheCoordinatorNoPrefixCache):
             i for i, g in enumerate(self.kv_cache_config.kv_cache_groups)
             if any("draft_model." in n for n in g.layer_names)
         }
+        blocks_per_group = getattr(
+            self.kv_cache_config, "num_blocks_per_group", None)
+        if blocks_per_group is not None:
+            if self.kv_cache_config.needs_kv_cache_zeroing:
+                raise ValueError(
+                    "AsymSpec asymmetric KV pools require uniform-precision "
+                    "attention KV without cache zeroing")
+            if self.enable_caching:
+                raise ValueError(
+                    "AsymSpec asymmetric KV pools do not support prefix caching")
+
+            # Group-local block IDs are safe because attention consumes a
+            # group's block table only with that group's layer tensors. No
+            # pool is shared, so colliding numeric IDs never alias storage.
+            enable_events = (args[4] if len(args) > 4
+                             else kwargs.get("enable_kv_cache_events", False))
+            if enable_events:
+                raise ValueError(
+                    "AsymSpec asymmetric KV pools do not support KV cache "
+                    "events because block IDs are group-local")
+            hash_block_size = kwargs.get("hash_block_size")
+            metrics_collector = kwargs.get("metrics_collector")
+            self.block_pools = tuple(
+                BlockPool(
+                    num_gpu_blocks=count,
+                    enable_caching=False,
+                    hash_block_size=hash_block_size,
+                    enable_kv_cache_events=enable_events,
+                    metrics_collector=(metrics_collector if gid == 0 else None),
+                )
+                for gid, count in enumerate(blocks_per_group)
+            )
+            max_lens = self.kv_cache_config.max_model_len_per_group
+            max_in_flight_tokens = (args[2] if len(args) > 2
+                                    else kwargs["max_in_flight_tokens"])
+            dcp_world_size = kwargs.get("dcp_world_size")
+            pcp_world_size = kwargs.get("pcp_world_size")
+            self.single_type_managers = tuple(
+                get_manager_for_kv_cache_spec(
+                    kv_cache_spec=group.kv_cache_spec,
+                    max_in_flight_tokens=max_in_flight_tokens,
+                    max_model_len=max_lens[gid],
+                    block_pool=self.block_pools[gid],
+                    enable_caching=False,
+                    kv_cache_group_id=gid,
+                    dcp_world_size=dcp_world_size,
+                    pcp_world_size=pcp_world_size,
+                    scheduler_block_size=self.scheduler_block_size,
+                    needs_kv_cache_zeroing=False,
+                )
+                for gid, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            )
+            # Retain the compressed pool as the compatibility handle. All
+            # asymmetric admission/free/accounting uses block_pools directly.
+            self.block_pool = self.block_pools[0]
+            logger.info(
+                "AsymSpec created independent BlockPools: %s",
+                ", ".join(f"gid{i}={n}" for i, n in enumerate(blocks_per_group)),
+            )
+
+    @property
+    def has_asymmetric_pools(self):
+        return hasattr(self, "block_pools")
 
     def _view_tokens(self, gid, request_id, num_tokens):
         offset = self.aug_offsets.get(request_id, 0) if gid in self.drafter_gids else 0
@@ -992,6 +1055,53 @@ class SpecSteerKVCacheCoordinator(KVCacheCoordinatorNoPrefixCache):
                     apply_admission_cap=apply_admission_cap,
                 )
         return num_blocks_to_allocate
+
+    def get_num_blocks_to_allocate_per_group(
+        self,
+        request_id,
+        num_tokens,
+        new_computed_blocks,
+        num_encoder_tokens,
+        total_computed_tokens,
+        num_local_computed_tokens,
+        num_tokens_main_model,
+        apply_admission_cap=False,
+    ):
+        """Return group-local requirements for independent BlockPools."""
+        required = []
+        for i, manager in enumerate(self.single_type_managers):
+            view_tokens = self._view_tokens(i, request_id, num_tokens)
+            if view_tokens > self.kv_cache_config.max_model_len_per_group[i]:
+                return [pool.get_num_free_blocks() + 1
+                        for pool in self.block_pools]
+            required.append(manager.get_num_blocks_to_allocate(
+                request_id,
+                num_encoder_tokens if isinstance(manager, CrossAttentionManager)
+                else view_tokens,
+                [] if isinstance(manager, CrossAttentionManager)
+                else new_computed_blocks[i],
+                0 if isinstance(manager, CrossAttentionManager)
+                else total_computed_tokens,
+                0 if isinstance(manager, CrossAttentionManager)
+                else num_local_computed_tokens,
+                num_encoder_tokens if isinstance(manager, CrossAttentionManager)
+                else num_tokens_main_model,
+                apply_admission_cap=apply_admission_cap,
+            ))
+        return required
+
+    def can_allocate(self, *, reserved_blocks=0, watermark_blocks=0, **kwargs):
+        required = self.get_num_blocks_to_allocate_per_group(**kwargs)
+        return all(
+            need + watermark_blocks
+            <= pool.get_num_free_blocks() - reserved_blocks
+            for need, pool in zip(required, self.block_pools)
+        )
+
+    def get_usage(self):
+        if self.has_asymmetric_pools:
+            return max(pool.get_usage() for pool in self.block_pools)
+        return self.block_pool.get_usage()
 
     def allocate_new_blocks(
         self,

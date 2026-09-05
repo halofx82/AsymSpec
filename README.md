@@ -120,6 +120,17 @@ python scripts/bench_lb.py --mode specsteer --slm 4B --K 2 \
   --cell asymspec --out outputs/longbench/metrics.json \
   --responses outputs/longbench/responses.jsonl
 
+# Asymmetric KV capacity: 24K full context, 8K compressed context, no offload
+python scripts/bench_lb.py --mode specsteer --slm 4B --tp 4 --K 2 \
+  --max_model_len 24576 --specsteer-main-max-model-len 8192 \
+  --cpu_offload_gb 0 --max_new 1024 --enforce_eager \
+  --cell asymspec-24k-asymmetric --out outputs/longbench/asymmetric.json \
+  --responses outputs/longbench/asymmetric.jsonl
+
+# Exercise the full-context pool with a real near-limit native Qwen3 request
+CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/check_context_capacity.py \
+  --max-model-len 40960 --specsteer-main-max-model-len 8192 --max-new 16
+
 # MultiChallenge
 python scripts/bench_multichallenge.py --mode specsteer --slm 4B --K 2 \
   --beta 1.0 --gamma 0.5 --asym_method jsd \

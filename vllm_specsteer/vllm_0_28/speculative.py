@@ -304,6 +304,13 @@ class SpeculativeConfig:
     """AsymSpec delta-fusion strength."""
     specsteer_gamma: float = 0.5
     """AsymSpec base acceptance threshold."""
+    specsteer_main_max_model_len: int | None = Field(default=None, ge=1)
+    """Maximum compressed-context length for the verifier and base SLM.
+
+    When omitted, AsymSpec retains the legacy symmetric allocation and uses
+    the global model length for every path.  The global limit always remains
+    the full-context drafter limit.
+    """
 
     def compute_hash(self) -> str:
         """
@@ -327,6 +334,8 @@ class SpeculativeConfig:
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
+        # This controls AsymSpec KV tensor and block-table shapes.
+        factors.append(self.specsteer_main_max_model_len)
 
         if uses_aux_hidden_states and self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1349,6 +1358,19 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.specsteer_main_max_model_len is not None:
+            if self.method != "specsteer":
+                raise ValueError(
+                    "specsteer_main_max_model_len is only valid with "
+                    "method='specsteer'.")
+            if (
+                self.target_model_config is not None
+                and self.specsteer_main_max_model_len
+                > self.target_model_config.max_model_len
+            ):
+                raise ValueError(
+                    "specsteer_main_max_model_len cannot exceed the global "
+                    f"max_model_len ({self.target_model_config.max_model_len}).")
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "

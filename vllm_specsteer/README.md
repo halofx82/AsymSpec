@@ -41,6 +41,26 @@ delta     = log p_aug - log p_base
 fallback  = argmax(log p_target + beta * delta)
 ```
 
+## Asymmetric context capacity
+
+Set `specsteer_main_max_model_len` in `speculative_config` (or pass
+`--specsteer-main-max-model-len` to `bench_lb.py`) to allocate the compressed
+verifier/base path independently from the full-context drafter. For example,
+global `max_model_len=24576` and a main limit of `8192` allocate 24K only to
+the full 4B path and 8K to the 32B verifier plus compressed 4B path. The limit
+includes prompt tokens, generated tokens, and speculative lookahead.
+
+Omitting the option preserves the original symmetric cache allocation. The
+asymmetric path intentionally requires synchronous scheduling, uniform KV
+precision, no KV connector/offload, no KV-cache events, and no prefix caching.
+It uses independent BlockPools whose numeric block IDs are local to each cache
+group; attention block tables are already interpreted relative to their group.
+
+The two 4B views remain distinct module/attention trees, but the compressed
+view is structurally initialized on the meta device and shares every Parameter
+and registered buffer with the checkpoint-loaded full-context view. Startup
+therefore reads and materializes the 4B checkpoint once.
+
 See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the KV-cache implementation
 and equivalence argument.
 

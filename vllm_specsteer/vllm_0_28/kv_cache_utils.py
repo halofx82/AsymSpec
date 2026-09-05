@@ -1349,6 +1349,86 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    spec_cfg = vllm_config.speculative_config
+    main_limit = (
+        getattr(spec_cfg, "specsteer_main_max_model_len", None)
+        if spec_cfg is not None and spec_cfg.method == "specsteer"
+        else None
+    )
+    # The runner's temporary minimal cache used only for profiling deliberately
+    # sets an override with available_memory=0; keep that on vLLM's stock path.
+    is_minimal_profiling_cache = (
+        available_memory == 0
+        and vllm_config.cache_config.num_gpu_blocks_override is not None
+    )
+    if main_limit is not None and not is_minimal_profiling_cache:
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
+            raise ValueError(
+                "num_gpu_blocks_override is incompatible with AsymSpec "
+                "group-specific KV capacities")
+        if len(kv_cache_groups) != 2:
+            raise ValueError(
+                "AsymSpec asymmetric KV allocation expects exactly two cache "
+                f"groups, found {len(kv_cache_groups)}")
+
+        limits: list[int] = []
+        blocks_per_group: list[int] = []
+        tensors: list[KVCacheTensor] = []
+        required_bytes = 0
+        for gid, group in enumerate(kv_cache_groups):
+            is_drafter = any("draft_model." in name for name in group.layer_names)
+            limit = (vllm_config.model_config.max_model_len
+                     if is_drafter else main_limit)
+            limits.append(limit)
+            # BlockPool permanently reserves block zero as its null block.
+            num_blocks = cdiv(limit, group.kv_cache_spec.block_size) + 1
+            blocks_per_group.append(num_blocks)
+            per_layer_specs = (
+                group.kv_cache_spec.kv_cache_specs
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else None
+            )
+            for layer_name in group.layer_names:
+                layer_spec = (per_layer_specs[layer_name]
+                              if per_layer_specs is not None
+                              else group.kv_cache_spec)
+                size = layer_spec.page_size_bytes * num_blocks
+                required_bytes += size
+                # Separate pools use group-local block IDs, therefore tensors
+                # cannot be overlaid across groups as in vLLM's general layout.
+                tensors.append(KVCacheTensor(size=size, shared_by=[layer_name]))
+
+        if required_bytes > available_memory:
+            detail = ", ".join(
+                f"gid{gid}={limit} tokens/{blocks} blocks"
+                for gid, (limit, blocks) in enumerate(
+                    zip(limits, blocks_per_group)))
+            raise ValueError(
+                "Insufficient KV cache memory for AsymSpec asymmetric "
+                f"allocation: requires {format_gib(required_bytes)} GiB, "
+                f"available {format_gib(available_memory)} GiB ({detail}).")
+
+        config = KVCacheConfig(
+            num_blocks=max(blocks_per_group),
+            kv_cache_tensors=tensors,
+            kv_cache_groups=kv_cache_groups,
+        )
+        # vLLM 0.28's public dataclass has one scalar block count. This
+        # AsymSpec-only extension is carried by pickle and consumed only by
+        # the custom coordinator/worker paths.
+        config.num_blocks_per_group = blocks_per_group
+        config.max_model_len_per_group = limits
+        logger.info(
+            "AsymSpec asymmetric KV allocation: %s; %.2f GiB allocated "
+            "from %.2f GiB available",
+            ", ".join(
+                f"gid{gid}={limits[gid]} tokens/{blocks_per_group[gid]} blocks"
+                for gid in range(len(limits))),
+            required_bytes / 2**30,
+            available_memory / 2**30,
+        )
+        return config
+
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -2212,8 +2292,19 @@ def get_kv_cache_configs(
         )
 
     # Check if the available memory is enough per worker.
+    asymmetric_specsteer = (
+        vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.method == "specsteer"
+        and getattr(vllm_config.speculative_config,
+                    "specsteer_main_max_model_len", None) is not None
+    )
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
+            continue
+        if asymmetric_specsteer:
+            # The asymmetric builder below performs the exact per-group
+            # physical-memory check. The generic check assumes every group
+            # reaches global max_model_len and would reject valid layouts.
             continue
         _check_enough_kv_cache_memory(
             avail_mem,
@@ -2238,6 +2329,21 @@ def get_kv_cache_configs(
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
+    if asymmetric_specsteer:
+        min_blocks_per_group = [
+            min(config.num_blocks_per_group[gid]
+                for config in kv_cache_configs)
+            for gid in range(len(kv_cache_configs[0].kv_cache_groups))
+        ]
+        # Requested logical capacities are deterministic across ranks, so a
+        # difference would indicate a broken PP projection/layout.
+        for config in kv_cache_configs:
+            if config.num_blocks_per_group != min_blocks_per_group:
+                raise ValueError(
+                    "AsymSpec per-group KV capacities differ across workers; "
+                    "pipeline-sharded asymmetric allocation is unsupported")
+        return kv_cache_configs
+
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )

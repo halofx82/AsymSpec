@@ -66,6 +66,53 @@ else:
 
 logger = init_logger(__name__)
 
+
+def _install_specsteer_context_validation() -> None:
+    """Install request-level validation for AsymSpec's two context views."""
+    from vllm.exceptions import VLLMValidationError
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    if getattr(InputProcessor.process_inputs,
+               "_asymspec_context_validation", False):
+        return
+    original = InputProcessor.process_inputs
+
+    def process_inputs(processor, *args, **kwargs):
+        request = original(processor, *args, **kwargs)
+        spec = processor.speculative_config
+        main_limit = (getattr(spec, "specsteer_main_max_model_len", None)
+                      if spec is not None and spec.method == "specsteer"
+                      else None)
+        if main_limit is None or request.sampling_params is None:
+            return request
+
+        if request.prompt_token_ids is not None:
+            main_len = len(request.prompt_token_ids)
+        else:
+            main_len = int(request.prompt_embeds.shape[0])
+        max_tokens = request.sampling_params.max_tokens
+        assert max_tokens is not None
+        extra = request.sampling_params.extra_args or {}
+        aug_ids = extra.get("specsteer_aug_prompt_ids")
+        full_len = len(aug_ids) if aug_ids is not None else main_len
+        full_limit = processor.model_config.max_model_len
+
+        if main_len + max_tokens > main_limit:
+            raise VLLMValidationError(
+                "AsymSpec compressed context exceeds "
+                "specsteer_main_max_model_len: "
+                f"{main_len} prompt + {max_tokens} requested output tokens "
+                f"> {main_limit}.")
+        if full_len + max_tokens > full_limit:
+            raise VLLMValidationError(
+                "AsymSpec full context exceeds max_model_len: "
+                f"{full_len} prompt + {max_tokens} requested output tokens "
+                f"> {full_limit}.")
+        return request
+
+    process_inputs._asymspec_context_validation = True
+    InputProcessor.process_inputs = process_inputs
+
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "DeepseekV2ForCausalLM",
@@ -1056,6 +1103,9 @@ class VllmConfig:
             self.cache_config.enable_prefix_caching = False
             self.speculative_config.use_local_argmax_reduction = False
             self.speculative_config.use_heterogeneous_vocab = False
+            if getattr(self.speculative_config,
+                       "specsteer_main_max_model_len", None) is not None:
+                _install_specsteer_context_validation()
 
         """Verify configs are valid & consistent with each other."""
 
@@ -1719,6 +1769,18 @@ class VllmConfig:
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "specsteer"
+            and getattr(self.speculative_config,
+                        "specsteer_main_max_model_len", None) is not None
+            and self.kv_transfer_config is not None
+            and self.kv_transfer_config.kv_connector is not None
+        ):
+            raise ValueError(
+                "AsymSpec group-specific KV capacity does not support KV "
+                "connectors or KV offloading; remove the connector/offload "
+                "configuration")
 
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime

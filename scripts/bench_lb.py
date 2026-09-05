@@ -102,6 +102,12 @@ ap.add_argument("--max_cudagraph_size", type=int, default=128,
                 help="Cap cudagraph_capture_sizes; 128 is the validated vLLM 0.28 "
                      "inductor bugs without affecting BS=1.")
 ap.add_argument("--max_model_len", type=int, default=24576)
+ap.add_argument(
+    "--specsteer-main-max-model-len", "--specsteer_main_max_model_len",
+    dest="specsteer_main_max_model_len", type=int, default=None,
+    help=("Compressed-context verifier/base capacity. The global "
+          "--max_model_len remains the full-context drafter capacity."),
+)
 ap.add_argument("--gpu_memory_utilization", type=float, default=0.85)
 ap.add_argument("--cpu_offload_gb", type=float, default=0.0,
                 help="GiB of model weights to offload to CPU per GPU.")
@@ -424,6 +430,9 @@ if args.mode in ("specsteer", "scd"):
         "draft_tensor_parallel_size": args.tp,
         "specsteer_beta": args.beta, "specsteer_gamma": args.gamma,
     }
+    if args.specsteer_main_max_model_len is not None:
+        kwargs["speculative_config"]["specsteer_main_max_model_len"] = (
+            args.specsteer_main_max_model_len)
     os.environ["ASYMSPEC_METHOD"] = args.asym_method
     # scd mode forces the SCD-style two-model δ; specsteer honors --delta_src.
     os.environ["ASYMSPEC_DELTA_SRC"] = (
@@ -641,6 +650,7 @@ config_snapshot = {
     "max_model_len": args.max_model_len,
     "tensor_parallel_size": args.tp,
     "cpu_offload_gb": args.cpu_offload_gb,
+    "specsteer_main_max_model_len": args.specsteer_main_max_model_len,
     "gpu_memory_utilization": args.gpu_memory_utilization,
     "kv_cache_memory_bytes": kwargs.get("kv_cache_memory_bytes"),
     "yarn_factor": args.yarn_factor,
