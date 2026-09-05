@@ -1,9 +1,10 @@
 # AsymSpec: Context-Asymmetric Speculative Decoding
 
-Official implementation of **AsymSpec: Context-Asymmetric Speculative
-Decoding for Agentic LLMs** (EMNLP 2026).
-
-This sibling checkout ports the released integration to vLLM 0.28.0.
+This is a derived work based on the original **AsymSpec:
+Context-Asymmetric Speculative Decoding for Agentic LLMs** (EMNLP 2026)
+reference repository in the sibling [`../AsymSpec`](../AsymSpec) checkout.
+It ports that implementation from vLLM 0.19.0 to vLLM 0.28.0; it is not the
+original or official release.
 See [PORTING.md](PORTING.md) for provenance, validation status, and the
 4×RTX 3090 acceptance command. The original 0.19.0 checkout is unchanged.
 
