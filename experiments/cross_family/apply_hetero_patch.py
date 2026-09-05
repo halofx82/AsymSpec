@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the cross-vocabulary AsymSpec extension to vLLM 0.19.0.
+"""Apply the cross-vocabulary AsymSpec extension to vLLM 0.28.0.
 
 The operation is idempotent, saves pristine files as ``*.orig_hetero``, and
 gates all new behavior behind ``ASYMSPEC_HETERO_VOCAB=1``. See the directory

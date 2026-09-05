@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# AsymSpec proposer for vLLM 0.19.0. The legacy ``SpecSteer`` class and field
+# AsymSpec proposer for vLLM 0.28.0. The legacy ``SpecSteer`` class and field
 # names are retained to minimize changes to vLLM's integration surface.
 #
 # The proposer extends DraftModelProposer with a second view of the same small
@@ -33,330 +33,14 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 logger = init_logger(__name__)
 
 
-def _specsteer_cache_hygiene():
-    """Detect an unclean previous run and wipe torch.compile cache.
-
-    Why: vLLM writes inductor-compiled artifacts early in init (before
-    profile + warmup). If init crashes mid-way (OOM, illegal memory, SIGKILL,
-    timeout), cache keeps half-written .so/meta files that later reload and
-    dispatch to invalid memory — the same crash repeats and looks like a
-    model/hardware bug.
-
-    Mechanism: sentinel file at ~/.cache/vllm/.specsteer_clean_exit.
-      - Removed at startup; rewritten by atexit on clean exit.
-      - Missing at startup = previous run didn't exit cleanly → clear cache.
-
-    Opt out: SPECSTEER_CACHE_HYGIENE=0. Limitation: single-process assumption
-    (multi-run concurrency may falsely skip cleanup).
-    """
-    if os.environ.get("SPECSTEER_CACHE_HYGIENE", "1") == "0":
-        return
-    import shutil
-    import atexit
-    home_cache = os.path.expanduser("~/.cache/vllm")
-    sentinel = os.path.join(home_cache, ".specsteer_clean_exit")
-    cache_dir = os.path.join(home_cache, "torch_compile_cache")
-
-    if os.path.exists(sentinel):
-        try:
-            os.remove(sentinel)
-        except OSError:
-            pass
-    else:
-        if os.path.isdir(cache_dir) and os.listdir(cache_dir):
-            try:
-                shutil.rmtree(cache_dir)
-                os.makedirs(cache_dir, exist_ok=True)
-                logger.warning(
-                    "SpecSteer cache hygiene: cleared %s "
-                    "(no clean-exit sentinel; previous run likely crashed). "
-                    "Opt out with SPECSTEER_CACHE_HYGIENE=0.",
-                    cache_dir,
-                )
-            except OSError as e:
-                logger.warning("SpecSteer cache hygiene: clear failed: %s", e)
-
-    def _write_sentinel():
-        try:
-            os.makedirs(home_cache, exist_ok=True)
-            open(sentinel, "w").close()
-        except OSError:
-            pass
-
-    atexit.register(_write_sentinel)
-
-
-_specsteer_cache_hygiene()
-
-
 def _install_drafter_gid_split_patch():
-    """Split the full-context drafter into its own KV-cache group.
-
-    Default behavior (uniform-spec case): all 120 layers (LLM + drafter +
-    base) in 1 group, single block_table per request.
-
-    After patch: 2 groups —
-      - gid 0: LLM + base layers (share main ctx)
-      - gid 1: drafter layers (track the full context)
-
-    Note: patch is idempotent — re-applying is a no-op.
-    """
-    import vllm.v1.core.kv_cache_utils as _kvu
-
-    if getattr(_kvu, "_specsteer_patched", False):
-        return
-
-    _original = _kvu.get_kv_cache_groups
-
-    def _patched(vllm_config, kv_cache_spec):
-        groups = _original(vllm_config, kv_cache_spec)
-        # Split drafter out if present and currently merged with others.
-        drafter_pred = lambda n: "draft_model." in n
-        if len(groups) == 1:
-            g = groups[0]
-            drafter_layers = [n for n in g.layer_names if drafter_pred(n)]
-            other_layers = [n for n in g.layer_names if not drafter_pred(n)]
-            if drafter_layers and other_layers:
-                from vllm.v1.core.kv_cache_utils import (
-                    create_kv_cache_group_specs,
-                )
-                new_groups = create_kv_cache_group_specs(
-                    kv_cache_spec, [other_layers, drafter_layers],
-                )
-                logger.info(
-                    "AsymSpec: split drafter (%d layers) into "
-                    "gid=1; other (%d layers) stays in gid=0",
-                    len(drafter_layers), len(other_layers),
-                )
-                return new_groups
-        return groups
-
-    _kvu.get_kv_cache_groups = _patched
-    _kvu._specsteer_patched = True
-
-    # Also patch get_kv_cache_coordinator: our 2 groups have the SAME spec
-    # (both drafter and LLM+base use FullAttention/Qwen3 same block_size),
-    # so HybridKVCacheCoordinator's `len(attention_groups) > 1` assert fires
-    # (it's designed for full+sliding hybrid). Route to NoPrefixCache which
-    # supports arbitrary group counts without prefix-cache magic.
-    import vllm.v1.core.kv_cache_coordinator as _kvc
-    _orig_get_coord = _kvc.get_kv_cache_coordinator
-
-    def _patched_coord(kv_cache_config, max_model_len, use_eagle,
-                       enable_caching, enable_kv_cache_events,
-                       dcp_world_size, pcp_world_size, hash_block_size,
-                       metrics_collector=None):
-        # Detect our split: 2+ groups where ≥1 contains "draft_model." layers.
-        has_drafter_group = any(
-            any("draft_model." in n for n in g.layer_names)
-            for g in kv_cache_config.kv_cache_groups
-        )
-        n_groups = len(kv_cache_config.kv_cache_groups)
-        if has_drafter_group and n_groups >= 2:
-            logger.info(
-                "SpecSteer: routing to NoPrefixCache coordinator "
-                "(drafter in separate gid)",
-            )
-            return _kvc.KVCacheCoordinatorNoPrefixCache(
-                kv_cache_config, max_model_len, use_eagle,
-                enable_kv_cache_events,
-                dcp_world_size=dcp_world_size, pcp_world_size=pcp_world_size,
-                hash_block_size=hash_block_size,
-                metrics_collector=metrics_collector,
-            )
-        return _orig_get_coord(
-            kv_cache_config, max_model_len, use_eagle, enable_caching,
-            enable_kv_cache_events, dcp_world_size, pcp_world_size,
-            hash_block_size, metrics_collector,
-        )
-    _kvc.get_kv_cache_coordinator = _patched_coord
-
-    # Per-group token-count override.
-    # vLLM assumes one num_tokens per request across all gids. SpecSteer needs
-    # gid=1 (drafter) to have L_aug + max_new while gid=0 (LLM+base) has
-    # L_main + max_new. We maintain a request_id -> aug_len_offset registry
-    # (= L_aug - L_main, can be positive/negative/zero).
-    # Populated: KVCacheManager.allocate_slots (has Request object).
-    # Consumed: KVCacheCoordinator.get_num_blocks_to_allocate +
-    #           KVCacheCoordinator.allocate_new_blocks (use adjusted num_tokens
-    #           for the drafter gid).
-    # Cleaned: KVCacheCoordinator.free.
-    if not getattr(_kvu, "_specsteer_phase2_patched", False):
-        import vllm.v1.core.kv_cache_manager as _km
-        from vllm.v1.core.single_type_kv_cache_manager import (
-            CrossAttentionManager,
-        )
-
-        # Shared registries: aug_offsets (L_aug - L_main per req, used by
-        # block-allocation patches) and aug_prefilled (high-water mark of
-        # drafter aug positions already in KV, used by the merged-prefill
-        # path to skip already-cached aug context across streaming chunks).
-        # Both keyed by request_id; both cleaned on engine-side free.
-        _aug_offsets: dict[str, int] = {}
-        # CACHE KEY REDESIGN (correctness fix): the old design stored only
-        # `_aug_prefilled[rid] = L_prev` (length only). If the SAME rid sees
-        # an aug whose prefix was modified (rare but possible: chat-template
-        # tokenization can shift token boundaries when later content
-        # influences earlier tokens, or bench rewrites history), the length
-        # tracker would falsely indicate "L_prev tokens are in KV" → drafter
-        # would forward only [L_prev..L_now-1] over STALE KV → bad logits.
-        # New value type: (L_prev, prefix_hash) — verify prefix before reuse.
-        # On mismatch: drop cache (set L_prev = 0 → full prefill). This is
-        # byte-identical to old behavior for monotonically-extending aug
-        # (the streaming bench's normal pattern), but fail-safe on prefix
-        # mutation (catches the latent bug + enables future cross-step
-        # request_id sharing once the bench reuses rids properly).
-        _aug_prefilled: dict[str, tuple[int, int]] = {}
-        _kvu._specsteer_aug_offsets = _aug_offsets
-        _kvu._specsteer_aug_prefilled = _aug_prefilled
-        # Per-request multimodal data cache.
-        # Populated in _patched_alloc_slots when extra_args has pixel_values.
-        # Value: dict with keys "pixel_values" (Tensor), "image_grid_thw" (Tensor)
-        # Cleared in _patched_free along with _aug_offsets.
-        _aug_mm_data: dict[str, dict] = getattr(_kvu, "_specsteer_aug_mm_data", None)
-        if _aug_mm_data is None:
-            _aug_mm_data = {}
-            _kvu._specsteer_aug_mm_data = _aug_mm_data
-
-        def _find_drafter_gid(coord) -> int:
-            for i, g in enumerate(coord.kv_cache_config.kv_cache_groups):
-                if any("draft_model." in n for n in g.layer_names):
-                    return i
-            return -1
-
-        # Patch KVCacheManager.allocate_slots to record aug_len on first call
-        _orig_alloc_slots = _km.KVCacheManager.allocate_slots
-
-        import os as _os_v
-        _DEBUG_OFFSET_EVERY = _os_v.environ.get("SPECSTEER_DEBUG_OFFSET", "0") == "1"
-
-        def _patched_alloc_slots(self, request, *args, **kwargs):
-            sp = getattr(request, "sampling_params", None)
-            if sp is not None and sp.extra_args is not None:
-                aug_ids = sp.extra_args.get("specsteer_aug_prompt_ids")
-                # Capture multimodal data once per request.
-                _pv = sp.extra_args.get("specsteer_aug_pixel_values")
-                _gt = sp.extra_args.get("specsteer_aug_image_grid_thw")
-                if _pv is not None and _gt is not None:
-                    _aug_mm_data[request.request_id] = {
-                        "pixel_values": _pv,
-                        "image_grid_thw": _gt,
-                    }
-                    if not getattr(request, "_specsteer_mm_logged", False):
-                        try:
-                            _pv_shape = tuple(_pv.shape) if hasattr(_pv, "shape") else "?"
-                        except Exception:
-                            _pv_shape = "?"
-                        logger.info(
-                            "SpecSteer.mm: req %s captured pixel_values shape=%s "
-                            "grid_thw=%s",
-                            request.request_id, _pv_shape,
-                            _gt.tolist() if hasattr(_gt, "tolist") else _gt,
-                        )
-                        request._specsteer_mm_logged = True
-                if aug_ids:
-                    L_aug = len(aug_ids)
-                    L_main = request.num_prompt_tokens
-                    _aug_offsets[request.request_id] = L_aug - L_main
-                    if _DEBUG_OFFSET_EVERY:
-                        # Log EVERY allocate_slots call (per chunk) so we can
-                        # see how aug_offset evolves through the streaming
-                        # session (not just the session-start value).
-                        logger.info(
-                            "SpecSteer DEBUG_OFFSET: req %s aug_offset=%d "
-                            "(L_aug=%d - L_main=%d)",
-                            request.request_id, L_aug - L_main, L_aug, L_main,
-                        )
-                    elif not getattr(request, "_specsteer_logged", False):
-                        logger.info(
-                            "AsymSpec: req %s aug_offset=%d "
-                            "(L_aug=%d - L_main=%d)",
-                            request.request_id, L_aug - L_main, L_aug, L_main,
-                        )
-                        request._specsteer_logged = True
-            # Disable prefix caching while SpecSteer is active: dual-gid +
-            # variable aug_offset makes cache_blocks' main-model num_computed_tokens
-            # inconsistent with drafter's L_aug-sized blocks, firing
-            # block_pool.cache_full_blocks' `assert blk.block_hash is None`
-            # when a block gets cached twice across requests.
-            if not getattr(self, "_specsteer_no_cache_set", False):
-                self.enable_caching = False
-                self._specsteer_no_cache_set = True
-                logger.info(
-                    "SpecSteer: disabled prefix caching on KVCacheManager "
-                    "(incompatible with dual-gid aug_offset)"
-                )
-            return _orig_alloc_slots(self, request, *args, **kwargs)
-
-        _km.KVCacheManager.allocate_slots = _patched_alloc_slots
-
-        # Patch Coordinator to override num_tokens per-gid
-        _kvcc = _kvc  # reuse import
-        _orig_allocate_new_blocks = _kvcc.KVCacheCoordinator.allocate_new_blocks
-        _orig_get_num_blocks = _kvcc.KVCacheCoordinator.get_num_blocks_to_allocate
-        _orig_free = _kvcc.KVCacheCoordinator.free
-
-        def _patched_allocate_new_blocks(
-            self, request_id, num_tokens, num_tokens_main_model,
-            num_encoder_tokens=0,
-        ):
-            drafter_gid = _find_drafter_gid(self)
-            offset = _aug_offsets.get(request_id, 0)
-            if drafter_gid < 0 or offset == 0:
-                return _orig_allocate_new_blocks(
-                    self, request_id, num_tokens, num_tokens_main_model,
-                    num_encoder_tokens,
-                )
-            # Per-gid allocate with overridden num_tokens for drafter_gid
-            return tuple(
-                manager.allocate_new_blocks(
-                    request_id,
-                    (num_encoder_tokens if isinstance(manager, CrossAttentionManager)
-                     else (num_tokens + offset if i == drafter_gid else num_tokens)),
-                    num_tokens_main_model,
-                )
-                for i, manager in enumerate(self.single_type_managers)
-            )
-
-        def _patched_get_num_blocks(
-            self, request_id, num_tokens, new_computed_blocks,
-            num_encoder_tokens, total_computed_tokens, num_tokens_main_model,
-        ):
-            drafter_gid = _find_drafter_gid(self)
-            offset = _aug_offsets.get(request_id, 0)
-            if drafter_gid < 0 or offset == 0:
-                return _orig_get_num_blocks(
-                    self, request_id, num_tokens, new_computed_blocks,
-                    num_encoder_tokens, total_computed_tokens,
-                    num_tokens_main_model,
-                )
-            total = 0
-            for i, manager in enumerate(self.single_type_managers):
-                if isinstance(manager, CrossAttentionManager):
-                    total += manager.get_num_blocks_to_allocate(
-                        request_id, num_encoder_tokens,
-                        new_computed_blocks[i] if new_computed_blocks else [],
-                        0, num_encoder_tokens,
-                    )
-                else:
-                    nt = num_tokens + offset if i == drafter_gid else num_tokens
-                    total += manager.get_num_blocks_to_allocate(
-                        request_id, nt,
-                        new_computed_blocks[i] if new_computed_blocks else [],
-                        total_computed_tokens, num_tokens_main_model,
-                    )
-            return total
-
-        def _patched_free(self, request_id):
-            _aug_offsets.pop(request_id, None)
-            _aug_prefilled.pop(request_id, None)
-            _aug_mm_data.pop(request_id, None)
-            return _orig_free(self, request_id)
-
-        _kvcc.KVCacheCoordinator.allocate_new_blocks = _patched_allocate_new_blocks
-        _kvcc.KVCacheCoordinator.get_num_blocks_to_allocate = _patched_get_num_blocks
-        _kvcc.KVCacheCoordinator.free = _patched_free
-        _kvu._specsteer_phase2_patched = True
+    # Scheduler integration is deployed in core/*.py. Only worker-local
+    # caches live here; never delete another run's compilation cache.
+    import vllm.v1.core.kv_cache_utils as kvu
+    for name in ("_specsteer_aug_offsets", "_specsteer_aug_prefilled",
+                 "_specsteer_aug_mm_data"):
+        if not hasattr(kvu, name):
+            setattr(kvu, name, {})
 
 
 class SpecSteerProposer(DraftModelProposer):
@@ -391,6 +75,16 @@ class SpecSteerProposer(DraftModelProposer):
 
     Opt-in via speculative_config.method == "specsteer".
     """
+
+    def model_returns_tuple(self):
+        return False
+
+    def _raise_if_mrope(self):
+        # AsymSpec supplies its own image embeddings and M-RoPE positions.
+        pass
+
+    def _warn_if_multimodal(self):
+        pass
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
         # Install KV-cache-group split patch BEFORE super (which may allocate
@@ -675,6 +369,33 @@ class SpecSteerProposer(DraftModelProposer):
                 vllm_config=draft_vllm_config,
                 prefix="specsteer_base",
             )
+        # Both views use identical frozen weights. Keep distinct module and
+        # attention objects (and therefore distinct KV cache layer names), but
+        # alias parameter storage so the second view does not consume another
+        # drafter-sized allocation. This is required for the 4x24 GiB profile:
+        # three independent KV views need more memory than duplicate weights
+        # leave available. Parameter sharing is exact and gradients are off.
+        draft_params = dict(drafter.named_parameters())
+        base_params = dict(self.base_model.named_parameters())
+        if draft_params.keys() != base_params.keys():
+            missing = sorted(draft_params.keys() ^ base_params.keys())[:8]
+            raise RuntimeError(
+                "AsymSpec base/drafter parameter layouts differ: " + repr(missing))
+        shared_bytes = 0
+        for name, draft_param in draft_params.items():
+            parent = self.base_model
+            parts = name.split(".")
+            for part in parts[:-1]:
+                parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+            base_param = parent._parameters[parts[-1]]
+            shared_bytes += base_param.numel() * base_param.element_size()
+            parent._parameters[parts[-1]] = draft_param
+        del base_params
+        torch.cuda.empty_cache()
+        logger.info(
+            "AsymSpec: base view shares %.2f GiB of drafter parameter storage",
+            shared_bytes / (1024**3),
+        )
         after_base_attn = set(self._all_attn_layer_names())
 
         # Attn-layer bookkeeping: new layers introduced by each load.
@@ -686,6 +407,48 @@ class SpecSteerProposer(DraftModelProposer):
             len(drafter_new_layers), len(base_new_layers),
         )
         return drafter
+
+    def invalidate_requests(self, request_ids):
+        import vllm.v1.core.kv_cache_utils as kvu
+        for name in ("_specsteer_aug_offsets", "_specsteer_aug_prefilled",
+                     "_specsteer_aug_mm_data"):
+            for rid in request_ids:
+                getattr(kvu, name, {}).pop(rid, None)
+        for name in ("_base_prefilled", "_aug_bonus_computed",
+                     "_chunk_seen_aug_len", "_h_base_off"):
+            state = getattr(self, name, None)
+            for rid in request_ids:
+                if isinstance(state, set):
+                    state.discard(rid)
+                elif isinstance(state, dict):
+                    state.pop(rid, None)
+
+    def _sync_request_caches(self):
+        """Reconstruct worker-local metadata from transported request state."""
+        if self.runner is None:
+            return
+        import vllm.v1.core.kv_cache_utils as kvu
+        active = set(self.runner.requests)
+        for name in ("_specsteer_aug_offsets", "_specsteer_aug_prefilled",
+                     "_specsteer_aug_mm_data"):
+            registry = getattr(kvu, name)
+            for rid in set(registry) - active:
+                registry.pop(rid, None)
+        for rid, req in self.runner.requests.items():
+            extra = getattr(req.sampling_params, "extra_args", None) or {}
+            aug = extra.get("specsteer_aug_prompt_ids")
+            if aug:
+                kvu._specsteer_aug_offsets[rid] = len(aug) - req.num_prompt_tokens
+            if extra.get("specsteer_aug_pixel_values") is not None:
+                kvu._specsteer_aug_mm_data.setdefault(rid, {
+                    "pixel_values": extra["specsteer_aug_pixel_values"],
+                    "image_grid_thw": extra["specsteer_aug_image_grid_thw"],
+                })
+        # Freed/preempted requests must not retain logical cache state.
+        for name in ("_aug_bonus_computed", "_base_prefilled"):
+            state = getattr(self, name, None)
+            if isinstance(state, set):
+                state.intersection_update(active)
 
     def _all_attn_layer_names(self) -> set[str]:
         """Return the set of attn-layer names currently registered in the
@@ -764,7 +527,7 @@ class SpecSteerProposer(DraftModelProposer):
             if not layer_set or spec is None:
                 return []
             groups: dict[str, AttentionGroup] = {}
-            for layer_name in layer_set:
+            for layer_name in sorted(layer_set):
                 ab = all_attn_layers[layer_name].get_attn_backend()
                 key = ab.full_cls_name()
                 if key not in groups:
@@ -795,6 +558,8 @@ class SpecSteerProposer(DraftModelProposer):
                 self.draft_attn_groups[0].get_metadata_builder()
                 .kv_cache_spec.block_size
             )
+        if kernel_block_sizes is not None and drafter_gid >= 0:
+            self.block_size = kernel_block_sizes[drafter_gid]
 
 
         logger.info(
@@ -2432,7 +2197,17 @@ class SpecSteerProposer(DraftModelProposer):
         return result
 
     @override
-    def propose(self, *args, **kwargs):  # type: ignore[override]
+    def propose(self, num_speculative_tokens, *args, **kwargs):
+        self.num_speculative_tokens = num_speculative_tokens
+        # Bind the 0.28 signature once, keeping the legacy context-swap code
+        # keyword-based so it cannot confuse K with target_token_ids.
+        import inspect
+        bound = inspect.signature(super().propose).bind(
+            num_speculative_tokens, *args, **kwargs)
+        kwargs = dict(bound.arguments)
+        args = ()
+        self._sync_request_caches()
+
         self._reset_draft_logits()
         self._last_base_logits = None
 

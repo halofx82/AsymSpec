@@ -1,161 +1,123 @@
 #!/usr/bin/env python3
-"""Deploy the AsymSpec patches into the installed vLLM package.
-
-Hot-patches vLLM's pip-installed location. No vLLM fork is required.
-``vllm_specsteer/vllm_0_19/`` is the single release patch set and supports
-both text and multimodal drafters.
-
-Files deployed:
-  specsteer_model.py  → vllm/v1/spec_decode/specsteer_model.py
-  specsteer_sampler.py → vllm/v1/sample/specsteer_sampler.py
-  eagle.py → vllm/v1/spec_decode/eagle.py
-  speculative.py → vllm/config/speculative.py
-  gpu_model_runner.py → vllm/v1/worker/gpu_model_runner.py
-
-Originals are backed up before being overwritten. ``--revert`` restores them.
-
-Usage:
-  python scripts/deploy_specsteer.py --check
-  python scripts/deploy_specsteer.py --apply
-  python scripts/deploy_specsteer.py --revert
-"""
+"""Deploy/revert the version- and hash-checked AsymSpec vLLM 0.28 payload."""
 import argparse
 import hashlib
 import importlib.metadata
+import json
 import shutil
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from paths import REPO_ROOT, vllm_specsteer_targets
-
-VLLM_SPECSTEER = REPO_ROOT / "vllm_specsteer"
-PATCH_DIR = VLLM_SPECSTEER / "vllm_0_19"
-SUPPORTED_VLLM_VERSION = "0.19.0"
+ROOT = Path(__file__).resolve().parents[1]
+PATCH_DIR = ROOT / "vllm_specsteer/vllm_0_28"
+SUPPORTED_VLLM_VERSION = "0.28.0"
 
 
-def validate_vllm_version() -> str:
-    """Reject full-file patching against an incompatible vLLM layout."""
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+
+def package_root():
+    dist = importlib.metadata.distribution("vllm")
+    if dist.version != SUPPORTED_VLLM_VERSION:
+        raise RuntimeError(f"Expected vLLM {SUPPORTED_VLLM_VERSION}; found {dist.version}")
+    return Path(dist.locate_file("vllm")).resolve()
+
+
+def deployment_map(pkg=None):
+    pkg = package_root() if pkg is None else pkg
+    manifest = json.loads((PATCH_DIR / "manifest.json").read_text())
+    return [(PATCH_DIR / entry["source"], pkg / entry["target"], entry)
+            for entry in manifest["files"]]
+
+
+def apply(pkg, backup):
+    pairs = deployment_map(pkg)
+    state_path = backup / "state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else None
+    if state is not None and state["package"] != str(pkg):
+        raise RuntimeError("Backups belong to a different installation")
+    for src, dst, entry in pairs:
+        if not src.is_file() or not dst.parent.is_dir():
+            raise RuntimeError(f"Missing source or target directory: {src}, {dst.parent}")
+        current = sha256(dst)
+        allowed = {entry["upstream_sha256"], sha256(src)}
+        if state is not None:
+            allowed.add(state["deployed"].get(entry["target"]))
+        if current not in allowed:
+            raise RuntimeError(f"Unrecognized installed file; refusing overwrite: {dst}")
+        if current is None and entry["upstream_sha256"] is not None:
+            raise RuntimeError(f"Missing upstream file: {dst}")
+        if state is None and current == sha256(src) and entry["upstream_sha256"] is not None:
+            raise RuntimeError(f"Patched file without recoverable original: {dst}")
+    if state is None:
+        state = {"package": str(pkg), "original": {}, "deployed": {}}
+        backup.mkdir(parents=True, exist_ok=True)
+        for src, dst, entry in pairs:
+            rel = entry["target"]
+            state["original"][rel] = sha256(dst)
+            if dst.exists():
+                saved = backup / "original" / rel
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dst, saved)
+        state_path.write_text(json.dumps(state, indent=2) + "\n")
     try:
-        installed = importlib.metadata.version("vllm")
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise RuntimeError(
-            "vLLM is not installed. Install the pinned requirements first."
-        ) from exc
-    if installed != SUPPORTED_VLLM_VERSION:
-        raise RuntimeError(
-            f"Installed vLLM is {installed}, but these full-file patches target "
-            f"vLLM {SUPPORTED_VLLM_VERSION}. Refusing to overwrite an "
-            "incompatible installation; see VLLM_COMPATIBILITY.md."
-        )
-    return installed
+        for src, dst, entry in pairs:
+            shutil.copy2(src, dst)
+            state["deployed"][entry["target"]] = sha256(src)
+        state_path.write_text(json.dumps(state, indent=2) + "\n")
+    except Exception:
+        revert(pkg, backup, check_deployed=False)
+        raise
+    print(f"Deployed {len(pairs)} files into {pkg}")
 
 
-def md5_short(path: Path) -> str:
-    return hashlib.md5(path.read_bytes()).hexdigest()[:10]
-
-
-def deployment_map() -> list[tuple[Path, Path]]:
-    """Return the complete release patch mapping for vLLM 0.19.0."""
-    if not PATCH_DIR.exists():
-        raise FileNotFoundError(f"patch directory not found: {PATCH_DIR}")
-    spec_model_tgt, sampler_tgt = vllm_specsteer_targets()
-    vllm_pkg = spec_model_tgt.parents[2]
-    return [
-        (PATCH_DIR / "specsteer_model.py", spec_model_tgt),
-        (PATCH_DIR / "specsteer_sampler.py", sampler_tgt),
-        (PATCH_DIR / "eagle.py", spec_model_tgt.parent / "eagle.py"),
-        (PATCH_DIR / "speculative.py", vllm_pkg / "config" / "speculative.py"),
-        (PATCH_DIR / "gpu_model_runner.py",
-         vllm_pkg / "v1" / "worker" / "gpu_model_runner.py"),
-    ]
-
-
-def cmd_check() -> None:
-    installed = validate_vllm_version()
-    print(f"vLLM:     {installed} (supported)")
-    print(f"Source:   {PATCH_DIR.relative_to(REPO_ROOT)}/")
-    pairs = deployment_map()
-    print(f"Package:  {pairs[0][1].parents[2]}/\n")
-    for src, tgt in pairs:
-        s_md5 = md5_short(src) if src.exists() else "MISSING   "
-        t_md5 = md5_short(tgt) if tgt.exists() else "MISSING   "
-        same = src.exists() and tgt.exists() and md5_short(src) == md5_short(tgt)
-        mark = "≡" if same else "≠"
-        print(f"  {mark}  src {s_md5}  {src.relative_to(REPO_ROOT)}")
-        print(f"     tgt {t_md5}  {tgt}")
-
-
-def cmd_apply(backup_dir: Path) -> None:
-    validate_vllm_version()
-    pairs = deployment_map()
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    deployed = 0
-    skipped = 0
-    for src, tgt in pairs:
-        if not src.exists():
-            print(f"  ⚠  source missing: {src}")
-            continue
-        if not tgt.parent.exists():
-            print(f"  ✗  target dir missing: {tgt.parent}  (vllm not installed?)")
-            continue
-        if tgt.exists() and md5_short(src) == md5_short(tgt):
-            print(f"  ≡  unchanged: {tgt.name}")
-            skipped += 1
-            continue
-        if tgt.exists():
-            bak = backup_dir / tgt.name
-            if not bak.exists():
-                shutil.copy2(tgt, bak)
-                print(f"  💾 backup: {tgt.name} → {bak.relative_to(REPO_ROOT)}")
-        shutil.copy2(src, tgt)
-        print(f"  ✓  {src.relative_to(REPO_ROOT)} → {tgt}")
-        deployed += 1
-
-    print(f"\nDeployed {deployed}/{len(pairs)} ({skipped} unchanged).")
-    if deployed > 0:
-        print(f"Backup:  {backup_dir.relative_to(REPO_ROOT)}/")
-        print("Revert:  python scripts/deploy_specsteer.py --revert")
-
-
-def cmd_revert(backup_dir: Path) -> None:
-    validate_vllm_version()
-    if not backup_dir.exists():
-        print(f"✗  No backup at {backup_dir}")
-        return
-    name_to_tgt = {tgt.name: tgt for _, tgt in deployment_map()}
-    restored = 0
-    for bak in backup_dir.iterdir():
-        if bak.name in name_to_tgt:
-            tgt = name_to_tgt[bak.name]
-            shutil.copy2(bak, tgt)
-            print(f"  ✓  restore: {bak.name} → {tgt}")
-            restored += 1
-    print(f"\nRestored {restored} files from {backup_dir.relative_to(REPO_ROOT)}/")
+def revert(pkg, backup, check_deployed=True):
+    state_path = backup / "state.json"
+    if not state_path.exists():
+        raise RuntimeError(f"No deployment backup at {backup}")
+    state = json.loads(state_path.read_text())
+    if state["package"] != str(pkg):
+        raise RuntimeError("Backups belong to a different installation")
+    for rel, original_hash in state["original"].items():
+        if original_hash is not None and sha256(backup / "original" / rel) != original_hash:
+            raise RuntimeError(f"Missing/corrupt backup: {rel}")
+        if check_deployed and sha256(pkg / rel) not in {
+                original_hash, state["deployed"].get(rel)}:
+            raise RuntimeError(f"Installed file changed since deployment: {rel}")
+    for rel, original_hash in state["original"].items():
+        dst = pkg / rel
+        if original_hash is None:
+            dst.unlink(missing_ok=True)
+        else:
+            shutil.copy2(backup / "original" / rel, dst)
+    print("Restored original files; removed added modules. Backups retained.")
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Deploy AsymSpec patches into the pinned vLLM installation")
-    action = ap.add_mutually_exclusive_group(required=True)
-    action.add_argument("--check", action="store_true", help="Status only, no changes")
-    action.add_argument("--apply", action="store_true", help="Deploy patches (backs up originals)")
-    action.add_argument("--revert", action="store_true", help="Restore originals from backup")
-    args = ap.parse_args()
-
-    backup_dir = REPO_ROOT / ".backups" / "vllm_0_19"
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    action = parser.add_mutually_exclusive_group(required=True)
+    for flag in ("check", "apply", "revert"):
+        action.add_argument("--" + flag, action="store_true")
+    args = parser.parse_args()
     try:
-        if args.check:
-            cmd_check()
-        elif args.apply:
-            cmd_apply(backup_dir)
+        pkg = package_root()
+        backup = ROOT / ".backups/vllm_0_28"
+        if args.apply:
+            apply(pkg, backup)
         elif args.revert:
-            cmd_revert(backup_dir)
-    except RuntimeError as exc:
+            revert(pkg, backup)
+        else:
+            for src, dst, entry in deployment_map(pkg):
+                current = sha256(dst)
+                status = ("deployed" if current == sha256(src) else
+                          "upstream" if current == entry["upstream_sha256"] else "MODIFIED")
+                print(f"{status:10} {dst}")
+    except (RuntimeError, OSError, importlib.metadata.PackageNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    sys.exit(main())

@@ -314,7 +314,7 @@ def main():
     def _capture(self, *args, **kwargs):
         # vLLM signature changed: observe_draft now takes
         # (num_draft_tokens, num_accepted_tokens) — accept either positional
-        # or keyword (vLLM 0.19 passes these values by keyword).
+        # or keyword (supported runner versions may pass values by keyword).
         ndt = kwargs.get("num_draft_tokens", args[0] if args else 0)
         nat = kwargs.get("num_accepted_tokens", args[1] if len(args) > 1 else 0)
         SPEC["drafts"] += 1

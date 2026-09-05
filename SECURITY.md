@@ -2,7 +2,7 @@
 
 ## Research-artifact scope
 
-This release reproduces the paper implementation by patching vLLM 0.19.0.
+This release reproduces the paper implementation by patching vLLM 0.28.0.
 That compatibility pin and several transitive dependencies have known
 security advisories. The code should therefore be treated as an offline
 research artifact, not as a hardened production inference server.

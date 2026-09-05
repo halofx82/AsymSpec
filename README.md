@@ -3,6 +3,10 @@
 Official implementation of **AsymSpec: Context-Asymmetric Speculative
 Decoding for Agentic LLMs** (EMNLP 2026).
 
+This sibling checkout ports the released integration to vLLM 0.28.0.
+See [PORTING.md](PORTING.md) for provenance, validation status, and the
+4×RTX 3090 acceptance command. The original 0.19.0 checkout is unchanged.
+
 Paper: [arXiv:2608.26004](https://arxiv.org/abs/2608.26004)
 
 AsymSpec lets a lightweight drafter read the full context while the large
@@ -23,7 +27,7 @@ provenance.
 ## Repository layout
 
 ```text
-vllm_specsteer/              AsymSpec patches for vLLM 0.19.0
+vllm_specsteer/              AsymSpec patches for vLLM 0.28.0
 scripts/deploy_specsteer.py  Patch deployment and rollback helper
 scripts/bench_*.py           Paper benchmark harnesses
 scripts/asym_smolagents/     GAIA and SimpleQA agentic harnesses
@@ -38,14 +42,12 @@ implementation identifier. Public method names and reported results use
 
 ## Environment
 
-The patches target **vLLM 0.19.0**. Newer versions may change the patched
+The patches target **vLLM 0.28.0**. Newer versions may change the patched
 interfaces; see [`VLLM_COMPATIBILITY.md`](VLLM_COMPATIBILITY.md) for the
 source-level migration assessment.
 
-This compatibility pin has known security advisories in vLLM and transitive
-dependencies. Treat this repository as an offline research artifact: use an
-isolated environment, trusted inputs and weights, and do not expose the
-patched runtime as a public inference service. See [`SECURITY.md`](SECURITY.md).
+Use an isolated research environment with trusted inputs and weights.
+The port has not been audited for public serving. See [`SECURITY.md`](SECURITY.md).
 
 ```bash
 python -m venv .venv

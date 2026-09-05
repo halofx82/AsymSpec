@@ -13,7 +13,8 @@ def release_files():
     for directory, subdirs, filenames in os.walk(ROOT):
         subdirs[:] = [
             name for name in subdirs
-            if name not in {".git", "__pycache__", ".venv"}
+            if name not in {".git", "__pycache__", ".venv", ".cache", ".backups",
+                            "data", "outputs", "artifacts", "results", "runs"}
         ]
         base = Path(directory)
         for filename in filenames:
@@ -114,8 +115,8 @@ class ReleaseTreeTest(unittest.TestCase):
                     for item in node.value.elts
                 ]
 
-        model = (ROOT / "vllm_specsteer/vllm_0_19/specsteer_model.py").read_text()
-        sampler = (ROOT / "vllm_specsteer/vllm_0_19/specsteer_sampler.py").read_text()
+        model = (ROOT / "vllm_specsteer/vllm_0_28/specsteer_model.py").read_text()
+        sampler = (ROOT / "vllm_specsteer/vllm_0_28/specsteer_sampler.py").read_text()
         self.assertTrue(values)
         for list_name, source in [
             ("model_edits", model), ("sampler_edits", sampler),

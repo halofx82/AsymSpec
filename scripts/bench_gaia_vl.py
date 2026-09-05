@@ -285,7 +285,7 @@ def cfg_ss(samples, out_path, K=2, beta=1.0, gamma=0.5,
     print(f"\n=== CFG SS: VL drafter + text verifier  K={K} β={beta} γ={gamma} method={asym_method} ===", flush=True)
     from vllm import LLM, SamplingParams
     from transformers import AutoProcessor
-    import vllm.v1.spec_decode.metrics as _sdm  # vLLM 0.19 path
+    import vllm.v1.spec_decode.metrics as _sdm
 
     os.environ["ASYMSPEC_METHOD"] = asym_method
     os.environ["ASYMSPEC_DELTA_SRC"] = "ours"

@@ -64,6 +64,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max_summary_tokens", type=int, default=500)
     ap.add_argument("--max_model_len", type=int, default=24576)
+    ap.add_argument("--tp", type=int, default=1,
+                    help="Tensor parallel size.")
     ap.add_argument("--out", default=os.path.join(OUT_DIR, "summaries.jsonl"))
     ap.add_argument("--dry_run_n", type=int, default=0,
                     help="if >0, only process first N samples (smoke test)")
@@ -130,6 +132,7 @@ def main():
     t0 = time.perf_counter()
     llm = LLM(
         model=LLM_PATH, dtype="bfloat16", trust_remote_code=True,
+        tensor_parallel_size=args.tp,
         max_model_len=args.max_model_len, gpu_memory_utilization=0.85,
         enforce_eager=False, disable_log_stats=False,
         compilation_config=compilation_cfg,

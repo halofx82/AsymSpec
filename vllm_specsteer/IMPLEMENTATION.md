@@ -1,6 +1,6 @@
 # AsymSpec vLLM Implementation Notes
 
-This document describes the AsymSpec integration for vLLM 0.19.0, focusing on efficient compressed-context drafter evaluation (Path B) and its mathematical equivalence to full re-prefill.
+This document describes the AsymSpec integration for vLLM 0.28.0, focusing on efficient compressed-context drafter evaluation (Path B) and its mathematical equivalence to full re-prefill.
 
 ## 1. Algorithm recap
 
@@ -178,6 +178,6 @@ AsymSpec maintains the base drafter's KV cache across speculation steps and forw
 
 ## References
 
-- Release implementation: `vllm_specsteer/vllm_0_19/specsteer_model.py`
+- Release implementation: `vllm_specsteer/vllm_0_28/specsteer_model.py`
 - vLLM incremental decoding (general): `vllm/v1/worker/gpu_model_runner.py` — same KV cache pattern applied to LLM verifier
 - Code: `SpecSteerProposer._base_parallel_verify` (line ~806) and `SpecSteerProposer.propose` (line ~2114)

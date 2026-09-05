@@ -1,7 +1,7 @@
 AsymSpec
 Copyright 2026 AsymSpec contributors
 
-This product includes modifications and integration code for vLLM 0.19.0.
+This product includes modifications and integration code for vLLM 0.28.0.
 vLLM is distributed under the Apache License 2.0. The corresponding upstream
 copyright and license notices remain applicable to adapted files.
 

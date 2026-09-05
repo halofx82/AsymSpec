@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
 echo "==> Compile Python sources"
-python3 -m compileall -q .
+python3 -m compileall -q paths.py api_key_util.py scripts experiments tests vllm_specsteer
 
 echo "==> Run static regression tests"
 python3 -m unittest discover -s tests -v

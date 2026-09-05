@@ -6,7 +6,7 @@ retained to avoid a risky mass rename of the vLLM integration surface.
 
 ## Patch set
 
-`vllm_0_19/` is the single release patch set for vLLM 0.19.0. It supports
+`vllm_0_28/` is the single release patch set for vLLM 0.28.0. It supports
 both text and multimodal drafters. Use `scripts/deploy_specsteer.py`; do not
 copy files manually.
 
@@ -17,6 +17,12 @@ python scripts/deploy_specsteer.py --apply
 
 The helper locates the active vLLM installation dynamically, saves original
 files under `.backups/`, and supports `--revert`.
+
+The eight-file 0.28 payload adds the proposer and sampler and rebases six
+upstream files: speculative configuration, engine configuration, the V1 GPU
+runner, cache grouping, cache coordination, and cache management. Scheduler
+allocation no longer depends on worker-side monkey patches. Multimodal
+exceptions are confined to the AsymSpec proposer subclass.
 
 ## Per-step computation
 

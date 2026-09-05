@@ -130,9 +130,9 @@ class PaperDefaultsTest(unittest.TestCase):
 
     def test_internal_fallbacks_match_paper_defaults(self):
         files = [
-            "vllm_specsteer/vllm_0_19/specsteer_sampler.py",
-            "vllm_specsteer/vllm_0_19/specsteer_model.py",
-            "vllm_specsteer/vllm_0_19/speculative.py",
+            "vllm_specsteer/vllm_0_28/specsteer_sampler.py",
+            "vllm_specsteer/vllm_0_28/specsteer_model.py",
+            "vllm_specsteer/vllm_0_28/speculative.py",
         ]
         for relative_path in files:
             source = (ROOT / relative_path).read_text()

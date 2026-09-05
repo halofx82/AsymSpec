@@ -99,13 +99,17 @@ ap.add_argument("--responses", required=True)
 ap.add_argument("--bs", type=int, default=1)
 ap.add_argument("--enforce_eager", action="store_true")
 ap.add_argument("--max_cudagraph_size", type=int, default=128,
-                help="Cap cudagraph_capture_sizes; 128 covers vLLM 0.19 "
+                help="Cap cudagraph_capture_sizes; 128 is the validated vLLM 0.28 "
                      "inductor bugs without affecting BS=1.")
 ap.add_argument("--max_model_len", type=int, default=24576)
 ap.add_argument("--gpu_memory_utilization", type=float, default=0.85)
+ap.add_argument("--cpu_offload_gb", type=float, default=0.0,
+                help="GiB of model weights to offload to CPU per GPU.")
+ap.add_argument("--tp", type=int, default=1,
+                help="Tensor parallel size for verifier and drafter.")
 # YaRN rope-scaling to extend Qwen3's native 40960 window. Applied symmetrically
 # to verifier (via hf_overrides) AND drafter (via SpeculativeConfig monkey-patch
-# — vLLM 0.19's drafter ModelConfig hardcodes hf_overrides=hf_config_override
+# — the drafter ModelConfig hardcodes hf_overrides=hf_config_override
 # callable and ignores the speculative_config dict's hf fields, so the only
 # non-destructive path is to chain that staticmethod at runtime). Both models
 # must share rope_scaling for K-token speculation alignment to remain valid.
@@ -171,7 +175,7 @@ _sdm.SpecDecodingStats.observe_draft = _capture_observe_draft
 # driver's free-memory view lags. Poll until the assigned physical GPU has
 # >= 130GB free, or timeout after 300s.
 _cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-if _cvd:
+if _cvd and args.tp == 1:
     import subprocess
     _phys = _cvd.split(",")[0]
     _deadline = time.time() + 300
@@ -373,14 +377,25 @@ BASE_MODEL = SLM_PATH if args.mode in ("b1_drafter_aug", "b1_drafter_main") else
 kwargs = dict(
     model=BASE_MODEL, dtype="bfloat16", trust_remote_code=True,
     max_model_len=args.max_model_len,
-    # max_num_batched_tokens controls vLLM's compile_ranges_endpoints upper
-    # bound. Default 16384 fails for SpecSteer's dual_forward when L_aug +
-    # L_main > 16384 (LongBench MuSiQue can hit ~17.8K aug + ~1.5K main =
-    # ~19K combined). Bump to max_model_len so any single forward fits.
-    max_num_batched_tokens=args.max_model_len,
+    tensor_parallel_size=args.tp,
+    cpu_offload_gb=args.cpu_offload_gb,
+    # Path B evaluates full and compressed views independently, so the legacy
+    # combined-forward requirement no longer applies. Keep a 16K scheduling
+    # batch and let chunked prefill cover the 24K sequence. Profiling a single
+    # 24K batch consumes enough activation memory to leave the three KV views
+    # just short of capacity on 24 GiB cards.
+    max_num_batched_tokens=min(args.max_model_len, 16384),
     gpu_memory_utilization=args.gpu_memory_utilization,
     enforce_eager=args.enforce_eager, disable_log_stats=False,
 )
+# vLLM's automatic profile assigns every otherwise-free byte to KV cache.  On
+# the validated 4x24 GiB setup that leaves too little transient workspace for
+# the longest augmented-context prefill.  The three AsymSpec cache views need
+# about 4.69 GiB/rank at 24K, so reserve 5 GiB and leave the remaining memory
+# as activation headroom for this exact hardware acceptance configuration.
+if (args.mode in ("specsteer", "scd") and args.tp == 4
+        and args.cpu_offload_gb > 0 and args.max_model_len == 24576):
+    kwargs["kv_cache_memory_bytes"] = 5 * 1024**3
 compilation_cfg = {
     "custom_ops": ["none", "+rms_norm"],
     "pass_config": {
@@ -406,6 +421,7 @@ if args.mode in ("specsteer", "scd"):
     kwargs["speculative_config"] = {
         "method": "specsteer", "model": SLM_PATH,
         "num_speculative_tokens": args.K,
+        "draft_tensor_parallel_size": args.tp,
         "specsteer_beta": args.beta, "specsteer_gamma": args.gamma,
     }
     os.environ["ASYMSPEC_METHOD"] = args.asym_method
@@ -422,6 +438,7 @@ elif args.mode in ("classical_sps_aug", "classical_sps_main"):
     kwargs["speculative_config"] = {
         "method": "draft_model", "model": SLM_PATH,
         "num_speculative_tokens": args.K,
+        "draft_tensor_parallel_size": args.tp,
     }
 
 # YaRN rope-scaling injection (optional, OFF by default). Extends Qwen3's
@@ -431,7 +448,7 @@ elif args.mode in ("classical_sps_aug", "classical_sps_main"):
 # reject-path comparison drift apart and acceptance rates collapse.
 #
 # Verifier: simple dict hf_overrides.
-# Drafter:  vLLM 0.19's SpeculativeConfig hardcodes
+# Drafter:  SpeculativeConfig hardcodes
 #           hf_overrides=SpeculativeConfig.hf_config_override (a callable);
 #           the speculative_config={} dict gives no other lever. We chain
 #           that staticmethod at runtime to inject rope_scaling.
@@ -474,8 +491,6 @@ if args.yarn_factor is not None:
 print(f"[setup] loading LLM (K={args.K}) model={BASE_MODEL}...", flush=True)
 llm = LLM(**kwargs)
 if args.mode in ("specsteer", "scd"):
-    runner = llm.llm_engine.model_executor.driver_worker.worker.model_runner
-    runner.drafter._pathb_skip_dual_base = True
     print("[setup] SpecSteer Path B enabled", flush=True)
 
 # Warmup
@@ -624,6 +639,10 @@ config_snapshot = {
     "enforce_eager": args.enforce_eager,
     "max_cudagraph_size": args.max_cudagraph_size,
     "max_model_len": args.max_model_len,
+    "tensor_parallel_size": args.tp,
+    "cpu_offload_gb": args.cpu_offload_gb,
+    "gpu_memory_utilization": args.gpu_memory_utilization,
+    "kv_cache_memory_bytes": kwargs.get("kv_cache_memory_bytes"),
     "yarn_factor": args.yarn_factor,
     "yarn_original_max": args.yarn_original_max if args.yarn_factor is not None else None,
 }

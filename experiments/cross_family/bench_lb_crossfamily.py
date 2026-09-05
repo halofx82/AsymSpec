@@ -118,13 +118,13 @@ ap.add_argument("--responses", required=True)
 ap.add_argument("--bs", type=int, default=1)
 ap.add_argument("--enforce_eager", action="store_true")
 ap.add_argument("--max_cudagraph_size", type=int, default=128,
-                help="Cap cudagraph_capture_sizes; 128 covers vLLM 0.19 "
+                help="Cap cudagraph_capture_sizes; 128 is the validated vLLM 0.28 "
                      "inductor bugs without affecting BS=1.")
 ap.add_argument("--max_model_len", type=int, default=24576)
 ap.add_argument("--gpu_memory_utilization", type=float, default=0.85)
 # YaRN rope-scaling to extend Qwen3's native 40960 window. Applied symmetrically
 # to verifier (via hf_overrides) AND drafter (via SpeculativeConfig monkey-patch
-# — vLLM 0.19's drafter ModelConfig hardcodes hf_overrides=hf_config_override
+# — the drafter ModelConfig hardcodes hf_overrides=hf_config_override
 # callable and ignores the speculative_config dict's hf fields, so the only
 # non-destructive path is to chain that staticmethod at runtime). Both models
 # must share rope_scaling for K-token speculation alignment to remain valid.
@@ -500,7 +500,7 @@ elif args.mode in ("classical_sps_aug", "classical_sps_main"):
 # reject-path comparison drift apart and acceptance rates collapse.
 #
 # Verifier: simple dict hf_overrides.
-# Drafter:  vLLM 0.19's SpeculativeConfig hardcodes
+# Drafter:  SpeculativeConfig hardcodes
 #           hf_overrides=SpeculativeConfig.hf_config_override (a callable);
 #           the speculative_config={} dict gives no other lever. We chain
 #           that staticmethod at runtime to inject rope_scaling.
@@ -543,15 +543,7 @@ if args.yarn_factor is not None:
 print(f"[setup] loading LLM (K={args.K}) model={BASE_MODEL}...", flush=True)
 llm = LLM(**kwargs)
 if args.mode in ("specsteer", "scd"):
-    # TP-aware: uniproc (TP=1) exposes driver_worker; multiproc (TP>1) does not.
-    # _pathb_skip_dual_base already defaults True in each worker's
-    # SpecSteerProposer.__init__ (specsteer_model.py:491), so TP>1 needs no poke.
-    _me = llm.llm_engine.model_executor
-    if hasattr(_me, "driver_worker"):
-        _me.driver_worker.worker.model_runner.drafter._pathb_skip_dual_base = True
-        print("[setup] SpecSteer Path B enabled (uniproc)", flush=True)
-    else:
-        print("[setup] SpecSteer Path B via per-worker default (TP>1)", flush=True)
+    print("[setup] SpecSteer Path B via per-worker default", flush=True)
 
 # Warmup — must mirror real requests' extra_args (hetero E4a asserts on
 # specsteer requests lacking base ids; same-vocab is tolerant either way).

@@ -1,0 +1,46 @@
+{
+  "vllm_version": "0.28.0",
+  "upstream_commit": "2cf0a6915ce544dc493a0990f2ea38d81601128a",
+  "files": [
+    {
+      "source": "speculative.py",
+      "target": "config/speculative.py",
+      "upstream_sha256": "bb2955435856aa85633e7d799ce0ba241641952d65ac21ae10f097000ebd98f2"
+    },
+    {
+      "source": "gpu_model_runner.py",
+      "target": "v1/worker/gpu_model_runner.py",
+      "upstream_sha256": "7f2890eefca1efe25565bf1c7e5906a87948ae922610a7aaac620b28b46f26aa"
+    },
+    {
+      "source": "vllm.py",
+      "target": "config/vllm.py",
+      "upstream_sha256": "fb07f95658ae0ee6e6c16c0f36e90f9179e8761221a45d4bf1aebe8bcf63cdcb"
+    },
+    {
+      "source": "kv_cache_utils.py",
+      "target": "v1/core/kv_cache_utils.py",
+      "upstream_sha256": "088f2201bee86fade694e78141b6e99a5cd0cdd23c5c7ab3526dd119f76e4aec"
+    },
+    {
+      "source": "kv_cache_coordinator.py",
+      "target": "v1/core/kv_cache_coordinator.py",
+      "upstream_sha256": "9e6542c45f138480b1a535a69ed5b16cf489e23b1185ef7e86bee096d4b1ccc6"
+    },
+    {
+      "source": "kv_cache_manager.py",
+      "target": "v1/core/kv_cache_manager.py",
+      "upstream_sha256": "2d20c3d98845cfd8d88a2f66b8fc6402ea1fcfbee16879d2364a4a9e45b8fa47"
+    },
+    {
+      "source": "specsteer_model.py",
+      "target": "v1/spec_decode/specsteer_model.py",
+      "upstream_sha256": null
+    },
+    {
+      "source": "specsteer_sampler.py",
+      "target": "v1/sample/specsteer_sampler.py",
+      "upstream_sha256": null
+    }
+  ]
+}

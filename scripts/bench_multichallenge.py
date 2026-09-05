@@ -69,7 +69,7 @@ ap.add_argument("--enforce_eager", action="store_true",
                 help="Disable CUDA graph capture entirely (last-resort).")
 ap.add_argument("--max_cudagraph_size", type=int, default=128,
                 help="Cap cudagraph_capture_sizes to <= this batch size. "
-                     "Default 128 covers the vLLM 0.19 inductor bug across all "
+                     "Default 128 is the validated vLLM 0.28 cap across all "
                      "(K, drafter) combos: custom_ops=['+rms_norm'] bypasses "
                      "the RMSNorm fusion bug, but Qwen3-1.7B (head_dim=128, "
                      "hidden=2048) has additional inductor kernel bugs at "
@@ -98,7 +98,7 @@ import vllm.config.speculative as _sc
 _sc.SpeculativeConfig.verify_equal_vocab_size_if_draft_model = lambda self: None
 
 # Monkey-patch BEFORE LLM instantiation so we capture spec decode stats from
-# the scheduler. vLLM 0.19 with disable_log_stats=True (default for offline
+# the scheduler. With disable_log_stats=True (default for offline
 # LLM) skips LoggingStatLogger entirely → patching SpecDecodingLogging.observe
 # does nothing. Patching SpecDecodingStats.observe_draft instead — that's the
 # source of truth, called by scheduler.make_spec_decoding_stats every step.
@@ -344,8 +344,6 @@ for _attempt in range(3):
 if llm is None:
     raise RuntimeError("LLM init failed 3× with OOM race")
 if args.mode in ("specsteer", "scd"):
-    runner = llm.llm_engine.model_executor.driver_worker.worker.model_runner
-    runner.drafter._pathb_skip_dual_base = True
     print("[setup] SpecSteer Path B enabled", flush=True)
 
 # Warmup

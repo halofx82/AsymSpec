@@ -277,13 +277,8 @@ class AsymSpecVLLMModel(VLLMModel):
 
         super().__init__(model_id=model_id, model_kwargs=model_kwargs, **kwargs)
 
-        # Enable PathB (skip dual base forward, O(K) per spec step).
-        try:
-            runner = self.model.llm_engine.model_executor.driver_worker.worker.model_runner
-            runner.drafter._pathb_skip_dual_base = True
-            print("[AsymSpec] PathB enabled", flush=True)
-        except Exception as e:
-            print(f"[AsymSpec] PathB enable failed: {e}", flush=True)
+        # Path B is enabled by default in every TP worker's proposer.
+        print("[AsymSpec] PathB enabled", flush=True)
 
         self.K = K
         self.gamma = gamma

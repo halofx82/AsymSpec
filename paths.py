@@ -26,6 +26,11 @@ REPO_ROOT = Path(os.environ.get(
     Path(__file__).resolve().parent,
 ))
 
+# Keep runtime artifacts local to this checkout, including spawned TP workers.
+os.environ.setdefault("VLLM_CACHE_ROOT", str(REPO_ROOT / ".cache/vllm"))
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(REPO_ROOT / ".cache/inductor"))
+os.environ.setdefault("TRITON_CACHE_DIR", str(REPO_ROOT / ".cache/triton"))
+
 # ── Models ────────────────────────────────────────────────────────────
 # HF IDs — resolved via HF cache, no machine-specific absolute paths.
 LLM_MODEL = os.environ.get("ASYMSPEC_MODEL_LLM", "Qwen/Qwen3-32B")
@@ -67,7 +72,7 @@ def vllm_specsteer_targets() -> tuple[Path, Path]:
     except ImportError as e:
         raise RuntimeError(
             "vllm not installed in current env. "
-            "Run `uv pip install vllm==0.19.0` first."
+            "Run `uv pip install vllm==0.28.0` first."
         ) from e
     vllm_pkg = Path(vllm.__file__).parent
     return (
