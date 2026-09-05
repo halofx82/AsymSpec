@@ -156,6 +156,23 @@ The agentic entry points are
 the paper: CDA via `jsd`, LLMLingua-2 ratio 0.3, two recent turns retained,
 and `K=2`.
 
+## Interactive chat
+
+Start a local terminal REPL (not a benchmark) after deploying the patches:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/chat_specsteer.py \
+  --tp 4 --max-model-len 40960 --specsteer-main-max-model-len 8192 \
+  --gpu-memory-utilization 0.97 --cpu-offload-gb 0 --enforce-eager
+```
+
+`--full-context-file` adds a document only to the full-context drafter;
+provide its corresponding concise summary with `--main-context-file` for the
+verifier/compressed path. Without files, the full path retains all chat turns,
+while the compressed path retains the newest complete turns that fit. Use
+`/reset` to clear history and `/quit` to exit. This is a terminal interface:
+stock vLLM's OpenAI server cannot carry the required second prompt stream.
+
 Run the dependency-light release checks with:
 
 ```bash
