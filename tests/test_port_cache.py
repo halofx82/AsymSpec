@@ -11,10 +11,12 @@ class Manager:
 
     def get_num_blocks_to_allocate(self, *args, **kwargs):
         self.predicted = args[1]
+        self.predicted_main = args[5]
         return (args[1] + 15) // 16
 
     def allocate_new_blocks(self, *args):
         self.allocated = args[1]
+        self.allocated_main = args[2]
         return [args[1]]
 
 
@@ -76,8 +78,15 @@ class CacheAccountingTest(unittest.TestCase):
                 n = coord.get_num_blocks_to_allocate('a', 600, ([], [], []), 20, 0, 0, 598)
                 coord.allocate_new_blocks('a', 600, 598, 20)
                 expected = [600, 600 + offset, 20]
+                expected_main = [598, 598 + offset, 20]
                 self.assertEqual([m.predicted for m in coord.single_type_managers], expected)
                 self.assertEqual([m.allocated for m in coord.single_type_managers], expected)
+                self.assertEqual(
+                    [m.predicted_main for m in coord.single_type_managers],
+                    expected_main)
+                self.assertEqual(
+                    [m.allocated_main for m in coord.single_type_managers],
+                    expected_main)
                 self.assertEqual(n, sum((x + 15) // 16 for x in expected))
                 coord.free('a')
                 self.assertNotIn('a', coord.aug_offsets)
@@ -93,6 +102,7 @@ class CacheAccountingTest(unittest.TestCase):
                                 kv_cache_spec=SimpleNamespace()),
             ],
             num_blocks_per_group=[513, 2561],
+            has_mixed_precision_kv_cache=False,
             max_model_len_per_group=[8192, 40960],
             needs_kv_cache_zeroing=False,
         )

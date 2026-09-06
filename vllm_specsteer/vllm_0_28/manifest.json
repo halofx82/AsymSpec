@@ -38,6 +38,11 @@
       "upstream_sha256": null
     },
     {
+      "source": "hybrid_specsteer.py",
+      "target": "v1/spec_decode/hybrid_specsteer.py",
+      "upstream_sha256": null
+    },
+    {
       "source": "specsteer_sampler.py",
       "target": "v1/sample/specsteer_sampler.py",
       "upstream_sha256": null

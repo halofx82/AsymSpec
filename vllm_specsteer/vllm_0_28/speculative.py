@@ -905,6 +905,15 @@ class SpeculativeConfig:
                 draft_hf_overrides: HfOverrides
                 if self.method == "medusa":
                     draft_hf_overrides = {"model_type": "medusa"}
+                elif self.method == "specsteer":
+                    # A Qwen3.5 checkpoint can contain MTP weights, but for
+                    # SpecSteer it is an ordinary external causal-LM drafter.
+                    # The stock draft override rewrites Qwen3.5 into
+                    # Qwen3_5MTP; deliberately skip that rewrite while still
+                    # preserving callable test/config transforms.
+                    target_override = self.target_model_config.hf_overrides
+                    draft_hf_overrides = (
+                        target_override if callable(target_override) else {})
                 else:
                     # Compose any callable hf_overrides set on the target so the
                     # draft config receives the same transform (e.g. the test
@@ -936,6 +945,17 @@ class SpeculativeConfig:
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
+                    # Qwen3.5 checkpoints are conditional-generation models.
+                    # SpecSteer only operates on token IDs, so the drafter must
+                    # take exactly the same language-only route as the target.
+                    # Without this the independently created draft ModelConfig
+                    # can materialize the vision tower despite the server using
+                    # --language-model-only.
+                    language_model_only=(
+                        self.target_model_config.multimodal_config is not None
+                        and self.target_model_config.multimodal_config
+                        .language_model_only
+                    ),
                 )
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
@@ -950,7 +970,9 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in (
+                    "eagle", "eagle3", "dflash", "dspark", "specsteer"
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B

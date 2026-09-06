@@ -179,6 +179,33 @@ prompt and a recent-history compressed prompt from a standard Chat Completions
 request. The compressed prompt's usage accounting is reported by vLLM as
 `usage.prompt_tokens`.
 
+### Hybrid Qwen3.5 / Qwen3.8 models
+
+The text-only hybrid pair uses vLLM's GDN/Mamba state machinery in addition to
+ordinary full-attention KV caches. Keep V1 enabled and prefix caching disabled:
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=0
+export ASYMSPEC_METHOD=jsd
+export ASYMSPEC_DELTA_SRC=ours
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3.8-27B \
+  --served-model-name qwen38-asymspec \
+  --language-model-only --dtype bfloat16 --tensor-parallel-size 4 \
+  --max-model-len 40960 --gpu-memory-utilization 0.97 \
+  --no-enable-prefix-caching --enforce-eager --generation-config vllm \
+  --speculative-config '{
+    "method": "specsteer", "model": "Qwen/Qwen3.5-4B",
+    "num_speculative_tokens": 2, "draft_tensor_parallel_size": 4,
+    "specsteer_beta": 1.0, "specsteer_gamma": 0.5,
+    "specsteer_main_max_model_len": 8192
+  }'
+```
+
+The same language-only setting is propagated to the 4B draft ModelConfig. The
+full drafter groups use `max_model_len`; compressed verifier/base groups use
+`specsteer_main_max_model_len`. Hybrid prefix caching is rejected explicitly.
+
 ```bash
 export ASYMSPEC_METHOD=jsd
 export ASYMSPEC_DELTA_SRC=ours

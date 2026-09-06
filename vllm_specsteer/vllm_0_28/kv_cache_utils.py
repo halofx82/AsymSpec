@@ -1366,10 +1366,11 @@ def get_kv_cache_config_from_groups(
             raise ValueError(
                 "num_gpu_blocks_override is incompatible with AsymSpec "
                 "group-specific KV capacities")
-        if len(kv_cache_groups) != 2:
-            raise ValueError(
-                "AsymSpec asymmetric KV allocation expects exactly two cache "
-                f"groups, found {len(kv_cache_groups)}")
+        # A pure-attention pair normally produces two groups. Hybrid Qwen3.5
+        # pairs additionally produce Mamba/GDN groups (and may split the
+        # compressed full-attention group by its physical page spec). Every
+        # group remains independently addressable, so size it by the view it
+        # belongs to rather than assuming a fixed group count.
 
         limits: list[int] = []
         blocks_per_group: list[int] = []
@@ -1381,7 +1382,22 @@ def get_kv_cache_config_from_groups(
                      if is_drafter else main_limit)
             limits.append(limit)
             # BlockPool permanently reserves block zero as its null block.
-            num_blocks = cdiv(limit, group.kv_cache_spec.block_size) + 1
+            # Hybrid Mamba/GDN groups additionally require native vLLM
+            # speculative-state checkpoint blocks.  They are not part of a
+            # token-linear context window, but MambaManager allocates them on
+            # the first prefill so an otherwise empty pool must reserve them.
+            # Without this, a short request is permanently admission-blocked
+            # (one usable block but one running-state plus checkpoint needed).
+            mamba_checkpoint_blocks = (
+                group.kv_cache_spec.num_speculative_blocks
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                else 0
+            )
+            num_blocks = (
+                cdiv(limit, group.kv_cache_spec.block_size)
+                + 1
+                + mamba_checkpoint_blocks
+            )
             blocks_per_group.append(num_blocks)
             per_layer_specs = (
                 group.kv_cache_spec.kv_cache_specs

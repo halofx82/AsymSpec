@@ -200,6 +200,7 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.hybrid_specsteer import is_auxiliary_state_layer
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -1004,6 +1005,13 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
+        self._specsteer_verifier_mamba_align = bool(
+            self.speculative_config is not None
+            and self.speculative_config.method == "specsteer"
+            and self.model_config.is_hybrid
+            and self.cache_config.mamba_cache_mode == "align"
+            and not self.cache_config.enable_prefix_caching
+        )
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
@@ -1121,16 +1129,68 @@ class GPUModelRunner(
         # decode + hybrid model.
         assert self.cache_config.mamba_cache_mode == "align"
         if self._mamba_bufs is None:
-            self._mamba_bufs = mamba_utils.MambaBuffers.create(
-                max_num_reqs=self.max_num_reqs,
-                kv_cache_config=self.kv_cache_config,
-                copy_funcs=self.model.get_mamba_state_copy_func(),
-                make_buffer=self._make_buffer,
-                device=self.device,
-                with_postprocess_align=(
-                    self.speculative_config is not None and self.model_config.is_hybrid
-                ),
-            )
+            if self._specsteer_verifier_mamba_align:
+                # The runner owns only the verifier's persistent recurrent
+                # state. The drafter and compressed base are separately
+                # rebuilt from committed histories and must never participate
+                # in this request-level state-index lifecycle.
+                verifier_group_ids = []
+                verifier_specs = []
+                for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                    spec = group.kv_cache_spec
+                    if not isinstance(spec, MambaSpec):
+                        continue
+                    if any(is_auxiliary_state_layer(name)
+                           for name in group.layer_names):
+                        continue
+                    verifier_group_ids.append(gid)
+                    verifier_specs.append(spec)
+                if not verifier_group_ids:
+                    raise RuntimeError(
+                        "Hybrid SpecSteer did not register a verifier GDN group"
+                    )
+                reference = verifier_specs[0]
+                if not all(spec == reference for spec in verifier_specs):
+                    raise RuntimeError(
+                        "Hybrid SpecSteer verifier GDN groups must have one "
+                        "uniform MambaSpec"
+                    )
+                copy_funcs = self.model.get_mamba_state_copy_func()
+                entries_per_req = sum(
+                    len(self.kv_cache_config.kv_cache_groups[gid].layer_names)
+                    for gid in verifier_group_ids
+                ) * len(copy_funcs)
+                n = self.max_num_reqs * entries_per_req
+                copy_buffers = mamba_utils.MambaCopyBuffers(
+                    src_ptrs=self._make_buffer(n, dtype=torch.uint64),
+                    dst_ptrs=self._make_buffer(n, dtype=torch.uint64),
+                    sizes=self._make_buffer(n, dtype=torch.int32),
+                    mamba_group_ids=verifier_group_ids,
+                    mamba_spec=reference,
+                )
+                self._mamba_bufs = mamba_utils.MambaBuffers(
+                    preprocess=copy_buffers,
+                    # The fused context assumes all Mamba groups and one
+                    # block-table stride. The verifier-only CPU copy path is
+                    # exact and leaves the other two logical views untouched.
+                    postprocess_align=None,
+                )
+                logger.info(
+                    "AsymSpec verifier-only aligned Mamba lifecycle: gids=%s",
+                    verifier_group_ids,
+                )
+            else:
+                self._mamba_bufs = mamba_utils.MambaBuffers.create(
+                    max_num_reqs=self.max_num_reqs,
+                    kv_cache_config=self.kv_cache_config,
+                    copy_funcs=self.model.get_mamba_state_copy_func(),
+                    make_buffer=self._make_buffer,
+                    device=self.device,
+                    with_postprocess_align=(
+                        self.speculative_config is not None
+                        and self.model_config.is_hybrid
+                    ),
+                )
         return self._mamba_bufs
 
     def _init_model_kwargs(self):
@@ -1658,18 +1718,27 @@ class GPUModelRunner(
             # update without CPU-GPU sync. The metadata
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
             # pre-staged to GPU buffers in _prepare_inputs.
-            mamba_utils.postprocess_mamba_align_gpu(
-                bufs=self._get_mamba_bufs(),
-                num_reqs=num_reqs,
-                num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
-                num_accepted_tokens_cpu_tensor=(
-                    self.input_batch.num_accepted_tokens_cpu_tensor
-                ),
-                input_batch=self.input_batch,
-                kv_cache_config=self.kv_cache_config,
-                forward_context=self.compilation_config.static_forward_context,
-                mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
-            )
+            mamba_bufs = self._get_mamba_bufs()
+            if mamba_bufs.postprocess_align is not None:
+                mamba_utils.postprocess_mamba_align_gpu(
+                    bufs=mamba_bufs,
+                    num_reqs=num_reqs,
+                    num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
+                    num_accepted_tokens_cpu_tensor=(
+                        self.input_batch.num_accepted_tokens_cpu_tensor
+                    ),
+                    input_batch=self.input_batch,
+                    kv_cache_config=self.kv_cache_config,
+                    forward_context=self.compilation_config.static_forward_context,
+                    mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
+                )
+            else:
+                # Non-fused aligned path: next iteration's preprocess copies
+                # the selected accepted state independently for each Mamba
+                # group.  Preserve vLLM's accepted-token handoff exactly.
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
 
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
@@ -4587,18 +4656,27 @@ class GPUModelRunner(
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
-                mamba_utils.preprocess_mamba(
-                    scheduler_output,
-                    self.kv_cache_config,
-                    self.cache_config,
-                    self.mamba_state_idx,
-                    self.input_batch,
-                    self.requests,
-                    self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
-                    mamba_bufs.preprocess,
-                    align_ctx=mamba_bufs.postprocess_align,
-                )
+                if self._specsteer_verifier_mamba_align:
+                    # `preprocess_mamba` only uses this flag for its upstream
+                    # align-mode assertion.  Scheduler prefix caching remains
+                    # disabled before and after the state-copy operation.
+                    self.cache_config.enable_prefix_caching = True
+                try:
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        mamba_bufs.preprocess,
+                        align_ctx=mamba_bufs.postprocess_align,
+                    )
+                finally:
+                    if self._specsteer_verifier_mamba_align:
+                        self.cache_config.enable_prefix_caching = False
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
                 # Re-sync to GPU so the mamba kernel reads from the

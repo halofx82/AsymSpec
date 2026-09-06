@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import os
+from copy import copy
 import torch
 import torch.nn as nn
 from typing_extensions import override
@@ -29,6 +30,12 @@ from typing_extensions import override
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.hybrid_specsteer import (
+    is_hybrid_model_config,
+    require_distinct_runtime_layer_sets,
+    split_hybrid_layer_names,
+    text_mrope_positions,
+)
 
 logger = init_logger(__name__)
 
@@ -193,8 +200,15 @@ class SpecSteerProposer(DraftModelProposer):
         # itself; we hook there to also initialize the base instance).
         self.base_model: nn.Module | None = None
         self._base_attn_layer_names: set[str] | None = None
+        self._hybrid_specsteer = False
+        self._base_full_attn_layer_names: set[str] = set()
+        self._base_gdn_layer_names: set[str] = set()
+        self._draft_full_attn_layer_names: set[str] = set()
+        self._draft_gdn_layer_names: set[str] = set()
         self.base_attn_groups: list = []   # filled by initialize_attn_backend
         self.base_kv_cache_gid: int = -1
+        self.base_kv_cache_gids: set[int] = set()
+        self.drafter_kv_cache_gids: set[int] = set()
         # PathB: base_logits computed via parallel_verify after the drafter
         # propose, NOT inline via dual_forward. This is the canonical
         # SpecSteer path — dual_forward base was an early experiment and is
@@ -233,12 +247,13 @@ class SpecSteerProposer(DraftModelProposer):
         self._prof_cache_misses = 0
         self._prof_cache_skipped_tokens = 0
 
-        # T1: pre-allocated buffers for fast base PV path.
-        # Incremental case writes K+2 tokens per req at [active-1..active+K].
-        # Buffers sized for max_bs × (K+2). First call falls back to slow path.
+        # T1: pre-allocated buffers for fast base PV path. Pure-attention
+        # models use the legacy K+2 warmup rewrite. Hybrid GDN metadata has a
+        # native speculative layout of exactly K+1 tokens, so it must start at
+        # the first uncomputed position instead.
         K = getattr(self, "num_speculative_tokens", 2) or 2
         max_bs = 256
-        tpr = K + 2  # tokens_per_req_incremental
+        tpr = K + (1 if self._hybrid_specsteer else 2)
         total = max_bs * tpr
         self._base_pv_max_bs = max_bs
         self._base_pv_tokens_per_req = tpr
@@ -260,7 +275,7 @@ class SpecSteerProposer(DraftModelProposer):
             * tpr
         )
         self._base_qsl_cpu = self._base_qsl_gpu.cpu()
-        # Per-req CPU staging (active-1, last_tok) — filled from input_batch
+        # Per-req CPU staging — filled from input_batch.
         self._base_staging_last_tok_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._base_staging_active_m1_cpu = torch.zeros(max_bs, dtype=torch.int32)
         # Track which req has had base prefill done
@@ -457,6 +472,28 @@ class SpecSteerProposer(DraftModelProposer):
         drafter_new_layers = after_drafter_attn - pre_attn
         base_new_layers = after_base_attn - after_drafter_attn
         self._base_attn_layer_names = base_new_layers
+        self._hybrid_specsteer = is_hybrid_model_config(
+            draft_vllm_config.model_config)
+        if self._hybrid_specsteer:
+            draft_names = {
+                name for name in drafter_new_layers if "draft_model." in name
+            }
+            base_names = {
+                name for name in base_new_layers if "specsteer_base." in name
+            }
+            require_distinct_runtime_layer_sets(draft_names, base_names)
+            (self._draft_full_attn_layer_names,
+             self._draft_gdn_layer_names) = split_hybrid_layer_names(draft_names)
+            (self._base_full_attn_layer_names,
+             self._base_gdn_layer_names) = split_hybrid_layer_names(base_names)
+            logger.info(
+                "AsymSpec hybrid runtime: drafter=%d full-attn + %d GDN; "
+                "base=%d full-attn + %d GDN",
+                len(self._draft_full_attn_layer_names),
+                len(self._draft_gdn_layer_names),
+                len(self._base_full_attn_layer_names),
+                len(self._base_gdn_layer_names),
+            )
         logger.info(
             "SpecSteer: loaded drafter (%d attn layers) + base (%d attn layers)",
             len(drafter_new_layers), len(base_new_layers),
@@ -518,6 +555,156 @@ class SpecSteerProposer(DraftModelProposer):
             ).keys()
         )
 
+    def _hybrid_text_positions(self, positions: torch.Tensor) -> torch.Tensor:
+        """Use Qwen3.5's native text M-RoPE representation.
+
+        vLLM's Qwen3.5 language-only model defines M-RoPE positions as three
+        equal text axes.  The legacy pure-Qwen3 path uses a 1-D arange; only
+        normalize it for a detected hybrid model.
+        """
+        if self._hybrid_specsteer and positions.dim() == 1:
+            return text_mrope_positions(positions)
+        return positions
+
+    def _build_base_layer_metadata(
+        self,
+        common_metadata,
+        num_reqs: int,
+        *,
+        use_speculative_gdn_state: bool = True,
+    ) -> dict:
+        """Build base metadata with each layer's own logical cache group.
+
+        Pure-attention SpecSteer historically reused one base block table for
+        every base layer.  That is invalid for Qwen3.5: GDN consumes a Mamba
+        state-index table while full attention consumes token KV slots.  The
+        native builders own both interpretations, so this method only selects
+        the correct group-local table and forwards vLLM's accepted-token state.
+        """
+        from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+
+        metadata: dict[str, object] = {}
+        for attn_group in self.base_attn_groups:
+            group_metadata = copy(common_metadata)
+            gid = attn_group.kv_cache_group_id
+            if gid != self.base_kv_cache_gid:
+                group_metadata.block_table_tensor = (
+                    self.runner.input_batch.block_table[gid].block_table.gpu[:num_reqs]
+                )
+                # Mamba ignores slot_mapping; full-attention groups use the
+                # group's own mapping when they are not the legacy base gid.
+                group_slot_mapping = getattr(
+                    self.runner.input_batch.block_table[gid], "slot_mapping", None
+                )
+                group_metadata.slot_mapping = (
+                    group_slot_mapping.gpu[:common_metadata.num_actual_tokens]
+                    if group_slot_mapping is not None else common_metadata.slot_mapping
+                )
+            spec = attn_group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[attn_group.layer_names[0]]
+            build_kwargs = {"common_prefix_len": 0,
+                            "common_attn_metadata": group_metadata,
+                            "fast_build": True}
+            if isinstance(spec, MambaSpec) and use_speculative_gdn_state:
+                # This is the same prior-step acceptance state supplied to
+                # native target GDN builders. It selects the committed
+                # recurrent state before this speculative step; rejected
+                # suffixes remain in speculative state slots.
+                build_kwargs["num_accepted_tokens"] = (
+                    self.runner.num_accepted_tokens.gpu[:num_reqs])
+                build_kwargs["num_decode_draft_tokens_cpu"] = (
+                    self.runner.num_decode_draft_tokens.cpu[:num_reqs])
+            built = attn_group.get_metadata_builder().build(**build_kwargs)
+            for layer_name in attn_group.layer_names:
+                metadata[layer_name] = built
+        return metadata
+
+    def _build_drafter_layer_metadata(
+        self,
+        common_metadata,
+        num_reqs: int,
+        *,
+        draft_index: int | None = None,
+        gdn_state_seq_lens: torch.Tensor | None = None,
+    ) -> dict:
+        """Build drafter metadata from each cache group's own block table.
+
+        Qwen3.5 splits full-attention and GDN layers into distinct cache
+        groups. Reusing the primary full-attention table for GDN addresses a
+        different physical pool and causes recurrent state corruption after a
+        few decode steps. Pure-attention models retain their existing layout.
+        """
+        metadata: dict[str, object] = {}
+        for attn_group in self.draft_attn_groups:
+            group_metadata = copy(common_metadata)
+            gid = attn_group.kv_cache_group_id
+            if gid != self.drafter_kv_cache_gid:
+                group_metadata.block_table_tensor = (
+                    self.runner.input_batch.block_table[gid].block_table.gpu[
+                        :num_reqs
+                    ]
+                )
+            spec = attn_group.kv_cache_spec
+            from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[attn_group.layer_names[0]]
+            # A hybrid proposal is rebuilt from committed history on every
+            # outer step. Its sequential inner drafts intentionally mutate one
+            # state slot: the scheduler's aligned state block may change at a
+            # token-block boundary, but no native auxiliary-state copy lifecycle
+            # owns these two model views. Pin only GDN metadata to the state
+            # selected by the committed prefix; token-KV metadata keeps true
+            # sequence lengths and positions.
+            if isinstance(spec, MambaSpec) and gdn_state_seq_lens is not None:
+                group_metadata.seq_lens = gdn_state_seq_lens
+                group_metadata._seq_lens_cpu = gdn_state_seq_lens.cpu()
+            builder = attn_group.get_metadata_builder()
+            if isinstance(spec, MambaSpec):
+                # Do not enter vLLM's speculative GDN protocol here: its
+                # accepted-token state ownership belongs to the verifier only.
+                built = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=group_metadata,
+                    fast_build=True,
+                )
+            elif draft_index is None:
+                built = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=group_metadata,
+                    fast_build=True,
+                )
+            else:
+                built = builder.build_for_drafting(
+                    common_attn_metadata=group_metadata,
+                    draft_index=draft_index,
+                )
+            for layer_name in attn_group.layer_names:
+                metadata[layer_name] = built
+        return metadata
+
+    def _base_slot_mapping_dict(self, slot_mapping: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return slot mappings only for token-KV base layers.
+
+        A GDN/Mamba group does not consume attention slots: its metadata
+        builder turns its group-local block table into recurrent-state indices.
+        Feeding it the full-attention slot mapping is not merely redundant;
+        the mapping has a different address space and can reach an invalid
+        CUDA state slot during the next speculative step.
+        """
+        from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+
+        result: dict[str, torch.Tensor] = {}
+        for group in self.base_attn_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[group.layer_names[0]]
+            if isinstance(spec, MambaSpec):
+                continue
+            for layer_name in group.layer_names:
+                result[layer_name] = slot_mapping
+        return result
+
     @override
     def validate_same_kv_cache_group(self, kv_cache_config) -> None:
         """The drafter and base model may be in different cache groups.
@@ -531,10 +718,10 @@ class SpecSteerProposer(DraftModelProposer):
                        if "draft_model." in ln}
         base_set = {ln for ln in self._draft_attn_layer_names
                     if "specsteer_base." in ln}
-        if drafter_set:
+        if drafter_set and not self._hybrid_specsteer:
             gids = {layer_to_gid[ln] for ln in drafter_set}
             assert len(gids) == 1, f"drafter in multiple gids: {gids}"
-        if base_set:
+        if base_set and not self._hybrid_specsteer:
             gids = {layer_to_gid[ln] for ln in base_set}
             assert len(gids) == 1, f"base in multiple gids: {gids}"
 
@@ -560,53 +747,68 @@ class SpecSteerProposer(DraftModelProposer):
             self.vllm_config, AttentionLayerBase,  # type: ignore[type-abstract]
         )
 
-        # Locate gids by layer prefix.
+        # Locate gids by layer prefix. Pure attention has one group per view;
+        # Qwen3.5 has a full-attention group and a separate GDN/Mamba group.
         drafter_set = {ln for ln in self._draft_attn_layer_names
                        if "draft_model." in ln}
         base_set = {ln for ln in self._draft_attn_layer_names
                     if "specsteer_base." in ln}
 
-        def _find_gid(layer_set):
+        def _find_gids(layer_set):
+            found = []
             for gid, g in enumerate(kv_cache_config.kv_cache_groups):
                 if layer_set & set(g.layer_names):
-                    return gid, g.kv_cache_spec
-            return -1, None
+                    found.append((gid, g.kv_cache_spec))
+            return found
 
-        drafter_gid, drafter_spec = _find_gid(drafter_set)
-        base_gid, base_spec = _find_gid(base_set)
+        draft_groups = _find_gids(drafter_set)
+        base_groups = _find_gids(base_set)
+        drafter_gid, drafter_spec = draft_groups[0] if draft_groups else (-1, None)
+        base_gid, base_spec = base_groups[0] if base_groups else (-1, None)
         self.kv_cache_gid = drafter_gid           # parent attribute (drafter)
         self.drafter_kv_cache_gid = drafter_gid   # explicit alias
         self.base_kv_cache_gid = base_gid
+        self.drafter_kv_cache_gids = {gid for gid, _ in draft_groups}
+        self.base_kv_cache_gids = {gid for gid, _ in base_groups}
+        if self._hybrid_specsteer and (len(draft_groups) < 2 or len(base_groups) < 2):
+            raise RuntimeError(
+                "Hybrid SpecSteer requires independent full-attention and "
+                "GDN cache groups for both 4B views")
 
-        def _build_groups(layer_set, gid, spec):
-            if not layer_set or spec is None:
+        def _build_groups(layer_set, located_groups):
+            if not layer_set or not located_groups:
                 return []
             groups: dict[str, AttentionGroup] = {}
-            for layer_name in sorted(layer_set):
-                ab = all_attn_layers[layer_name].get_attn_backend()
-                key = ab.full_cls_name()
-                if key not in groups:
-                    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
-                    layer_spec = spec
-                    if isinstance(spec, UniformTypeKVCacheSpecs):
-                        layer_spec = spec.kv_cache_specs[layer_name]
-                    kbs = (kernel_block_sizes[gid]
-                           if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
-                           else None)
-                    ag = AttentionGroup(
-                        backend=ab, layer_names=[layer_name],
-                        kv_cache_spec=layer_spec, kv_cache_group_id=gid,
-                    )
-                    ag.create_metadata_builders(
-                        self.vllm_config, self.device, kernel_block_size=kbs,
-                    )
-                    groups[key] = ag
-                else:
-                    groups[key].layer_names.append(layer_name)
+            for gid, spec in located_groups:
+                group_layers = sorted(
+                    layer_set & set(kv_cache_config.kv_cache_groups[gid].layer_names))
+                for layer_name in group_layers:
+                    ab = all_attn_layers[layer_name].get_attn_backend()
+                    # The gid is part of the key: same backend/spec in separate
+                    # logical views must never share mutable metadata buffers.
+                    key = f"{gid}:{ab.full_cls_name()}"
+                    if key not in groups:
+                        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+                        layer_spec = spec
+                        if isinstance(spec, UniformTypeKVCacheSpecs):
+                            layer_spec = spec.kv_cache_specs[layer_name]
+                        kbs = (kernel_block_sizes[gid]
+                               if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
+                               else None)
+                        ag = AttentionGroup(
+                            backend=ab, layer_names=[layer_name],
+                            kv_cache_spec=layer_spec, kv_cache_group_id=gid,
+                        )
+                        ag.create_metadata_builders(
+                            self.vllm_config, self.device, kernel_block_size=kbs,
+                        )
+                        groups[key] = ag
+                    else:
+                        groups[key].layer_names.append(layer_name)
             return list(groups.values())
 
-        self.draft_attn_groups = _build_groups(drafter_set, drafter_gid, drafter_spec)
-        self.base_attn_groups = _build_groups(base_set, base_gid, base_spec)
+        self.draft_attn_groups = _build_groups(drafter_set, draft_groups)
+        self.base_attn_groups = _build_groups(base_set, base_groups)
 
         if self.draft_attn_groups:
             self.block_size = (
@@ -674,6 +876,9 @@ class SpecSteerProposer(DraftModelProposer):
             return None
         if not hasattr(self, "_base_prefilled"):
             self._base_prefilled: set[str] = set()
+        initial_base_prefill = self._hybrid_specsteer or any(
+            req_ids[i] not in self._base_prefilled for i in range(B)
+        )
 
         # Per-request: build input tokens, positions, decide prefill/incremental
         all_input_tokens = []    # flat list across all requests
@@ -691,11 +896,26 @@ class SpecSteerProposer(DraftModelProposer):
             spec_tokens_i = (input_batch.spec_token_ids[i]
                              if hasattr(input_batch, "spec_token_ids") else [])
             active_i = num_committed_i + len(spec_tokens_i)
-            token_ids_i = input_batch.token_ids_cpu[i, :active_i]
+            # The hybrid fallback deliberately rebuilds GDN state rather than
+            # replaying native speculative checkpoints. Its seed must be the
+            # *committed* compressed history only: input_batch's speculative
+            # suffix can be rejected by the verifier and must never become a
+            # recurrent-state prefix on the next round.
+            prefix_len_i = num_committed_i if self._hybrid_specsteer else active_i
+            token_ids_i = input_batch.token_ids_cpu[i, :prefix_len_i]
             next_tok_i = (next_toks_per_req[i] if next_toks_per_req else None)
             nt_list = [next_tok_i] if next_tok_i is not None else []
 
-            if req_id_i not in self._base_prefilled:
+            if self._hybrid_specsteer:
+                # GDN recurrent state cannot safely use the attention-only
+                # rewrite/rollback protocol below. Rebuild the compressed
+                # sequence through vLLM's ordinary GDN prefill path for each
+                # verification round. This is deliberately conservative but
+                # gives the base exact compressed-context logits and leaves no
+                # rejected speculative suffix in its recurrent state.
+                start_pos_i = 0
+                input_tokens_i = list(token_ids_i) + nt_list + drafts_per_req[i]
+            elif req_id_i not in self._base_prefilled:
                 start_pos_i = 0
                 input_tokens_i = (
                     list(token_ids_i) + nt_list + drafts_per_req[i]
@@ -791,25 +1011,23 @@ class SpecSteerProposer(DraftModelProposer):
         # is the STANDARD prefill/decode path — build_for_drafting is tuned for
         # single-token autoregressive drafting shape and misbehaves on a
         # multi-token parallel forward.
-        per_layer_attn_metadata: dict[str, object] = {}
-        for attn_group in self.base_attn_groups:
-            # fast_build=True: skip AOT scheduler_metadata precompute (same
-            # reason as _compute_aug_first_bonus — avoids shape=9 FA3 crash
-            # when num_actual_tokens > max_cudagraph_size on first-req prefill).
-            attn_metadata = attn_group.get_metadata_builder().build(
-                common_prefix_len=0,
-                common_attn_metadata=cad,
-                fast_build=True,
-            )
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
+        per_layer_attn_metadata = self._build_base_layer_metadata(
+            cad,
+            B,
+            # The first base pass contains a complete compressed prompt plus
+            # proposal tokens. It is a real prefill, not the runner's target
+            # speculative batch, so its GDN state must be initialized through
+            # the ordinary recurrent prefill path. Reusing the target's
+            # accepted-token arrays here misclassifies the whole prompt as a
+            # K-token decode and corrupts its state slots asynchronously.
+            use_speculative_gdn_state=not (
+                self._hybrid_specsteer and initial_base_prefill),
+        )
 
-        # Slot mapping dict keyed by BOTH drafter + base layer names (shared).
-        # Base-only PV: slot_mapping keyed by base layer names only
-        # (drafter is in gid=1 with different block_table, doesn't run here).
-        base_layers_only = [n for n in self._draft_attn_layer_names
-                            if "specsteer_base." in n]
-        slot_mapping_dict = {name: slot_mapping for name in base_layers_only}
+        # GDN layers use their group-local recurrent-state indices from
+        # metadata, not token-KV slots. Only expose this mapping to the
+        # base full-attention layers.
+        slot_mapping_dict = self._base_slot_mapping_dict(slot_mapping)
 
         if not getattr(self, "_pv_logged", False):
             import logging as _log
@@ -836,7 +1054,7 @@ class SpecSteerProposer(DraftModelProposer):
         ):
             ret = _model_to_use(
                 input_ids=input_ids,
-                positions=positions,
+                positions=self._hybrid_text_positions(positions),
                 inputs_embeds=None,
             )
             hidden = ret[0] if isinstance(ret, tuple) else ret
@@ -885,11 +1103,11 @@ class SpecSteerProposer(DraftModelProposer):
     ) -> torch.Tensor | None:
         """T1: fast incremental base parallel verify.
 
-        Same semantic as _base_parallel_verify for incremental step: writes
-        [last_committed_token, next_token, drafts[0..K-1]] at positions
-        [active-1..active+K] per request, returns [B, K+1, V] taking the
-        last K+1 hidden's logits (first position in segment is the 'warmup'
-        rewrite of active-1 and its logit is discarded).
+        Pure-attention models retain the legacy warmup rewrite
+        ``[last, next, drafts...]``. Hybrid Qwen3.5 models instead use the
+        native GDN speculative layout ``[next, drafts...]`` at positions
+        ``[active..active+K]``. GDN's native metadata owns K+1 recurrent-state
+        indices; feeding it the legacy K+2 layout corrupts those state slots.
 
         Optimizations vs _base_parallel_verify:
           - No Python lists for input_tokens / positions — use GPU ops
@@ -906,6 +1124,12 @@ class SpecSteerProposer(DraftModelProposer):
 
         if self.runner is None or self.base_model is None or not self.base_attn_groups:
             return None
+        if self._hybrid_specsteer:
+            # See _base_parallel_verify: use an exact native GDN prefill for
+            # every round until the custom method has a native recurrent-state
+            # commit/rollback integration. The attention-only fast rewrite is
+            # invalid for GDN and can leave CUDA state slots corrupt.
+            return self._base_parallel_verify(drafts_flat, next_token_ids)
         input_batch = self.runner.input_batch
         B = input_batch.num_reqs
         if B < 1:
@@ -938,8 +1162,9 @@ class SpecSteerProposer(DraftModelProposer):
             return result
 
         # Check buffer capacity
-        tpr = self._base_pv_tokens_per_req  # K+2
-        if K + 2 != tpr or B > self._base_pv_max_bs:
+        tpr = self._base_pv_tokens_per_req
+        expected_tpr = K + (1 if self._hybrid_specsteer else 2)
+        if expected_tpr != tpr or B > self._base_pv_max_bs:
             # Shape changed or batch too large — fallback safely
             return self._base_parallel_verify(drafts_flat, next_token_ids)
 
@@ -951,8 +1176,8 @@ class SpecSteerProposer(DraftModelProposer):
         total_tokens = B * tpr
 
         # --- Gather per-req small-int state from CPU side (unavoidable) ---
-        # We need active_i = num_tokens_no_spec[i] + len(spec_token_ids[i])
-        # and last_tok_i = token_ids_cpu[i, active_i - 1]
+        # We need active_i = num_tokens_no_spec[i] + len(spec_token_ids[i]).
+        # The legacy pure-attention path additionally rewrites active_i - 1.
         last_tok_cpu = self._base_staging_last_tok_cpu[:B]
         active_m1_cpu = self._base_staging_active_m1_cpu[:B]
         for i in range(B):
@@ -972,37 +1197,42 @@ class SpecSteerProposer(DraftModelProposer):
         active_m1_gpu = active_m1_cpu.to(self.device, non_blocking=True).to(torch.int64)
 
         # --- Fill input_ids buffer on GPU ---
-        # Layout per req: [last_tok, next_tok, drafts[0..K-1]]
+        # Hybrid layout: [next_tok, drafts[0..K-1]].  The pure-attention
+        # compatibility layout retains [last_tok, next_tok, drafts...].
         input_ids_view = self._base_input_ids_buf[:total_tokens].view(B, tpr)
-        input_ids_view[:, 0].copy_(last_tok_gpu)
-        if next_token_ids is not None:
-            input_ids_view[:, 1].copy_(next_token_ids.view(-1).to(torch.int32))
+        next_tokens = (next_token_ids.view(-1).to(torch.int32)
+                       if next_token_ids is not None else last_tok_gpu)
+        if self._hybrid_specsteer:
+            input_ids_view[:, 0].copy_(next_tokens)
+            input_ids_view[:, 1:].copy_(drafts_flat.view(B, K).to(torch.int32))
         else:
-            # No next_tok — use last_tok (shouldn't happen but defensive)
-            input_ids_view[:, 1].copy_(last_tok_gpu)
-        input_ids_view[:, 2:].copy_(drafts_flat.view(B, K).to(torch.int32))
+            input_ids_view[:, 0].copy_(last_tok_gpu)
+            input_ids_view[:, 1].copy_(next_tokens)
+            input_ids_view[:, 2:].copy_(drafts_flat.view(B, K).to(torch.int32))
         input_ids_flat = self._base_input_ids_buf[:total_tokens]
 
         # --- Fill positions buffer on GPU ---
-        # positions[i, j] = active_m1[i] + j for j in [0..tpr-1]
+        # Hybrid GDN starts at the first uncomputed token; pure attention
+        # retains the active-1 warmup rewrite.
         positions_view = self._base_positions_buf[:total_tokens].view(B, tpr)
         offsets = torch.arange(0, tpr, dtype=torch.int64, device=self.device)
-        positions_view.copy_(active_m1_gpu[:, None] + offsets[None, :])
+        position_start = active_m1_gpu + (1 if self._hybrid_specsteer else 0)
+        positions_view.copy_(position_start[:, None] + offsets[None, :])
         positions_flat = self._base_positions_buf[:total_tokens]
 
         # --- Fill seq_lens buffer on GPU ---
-        # seq_lens[i] = (active_m1 + 1) + tpr = active + K + 1
+        # Both layouts end at active + K + 1.
         seq_lens = self._base_seq_lens_buf[:B]
-        seq_lens.copy_(active_m1_gpu.to(torch.int32))
-        seq_lens.add_(tpr)  # +K+2, seq_lens = active - 1 + tpr = active + K + 1
-        seq_lens_cpu = (active_m1_cpu.to(torch.int32) + tpr)  # CPU mirror
+        seq_lens.copy_(position_start.to(torch.int32))
+        seq_lens.add_(tpr)
+        seq_lens_cpu = position_start.cpu().to(torch.int32) + tpr
 
         # --- query_start_loc: static pre-computed ---
         query_start_loc = self._base_qsl_gpu[:B + 1]
         query_start_loc_cpu = self._base_qsl_cpu[:B + 1]
 
         # --- num_computed_tokens_cpu ---
-        num_computed_cpu = active_m1_cpu.to(torch.int32)
+        num_computed_cpu = position_start.cpu().to(torch.int32)
 
         # --- block_table + slot_mapping (gid=0 base shares with LLM) ---
         blk_tbl_obj = input_batch.block_table[self.base_kv_cache_gid]
@@ -1042,21 +1272,9 @@ class SpecSteerProposer(DraftModelProposer):
         )
 
         # Build per-layer attn_metadata for base
-        per_layer_attn_metadata: dict[str, object] = {}
-        for attn_group in self.base_attn_groups:
-            # fast_build=True: skip AOT scheduler_metadata precompute (same
-            # reason as other build sites — base PV K+1 forward is small and
-            # eager is fast; avoids FA3 shape mismatch crash).
-            meta = attn_group.get_metadata_builder().build(
-                common_prefix_len=0, common_attn_metadata=cad,
-                fast_build=True,
-            )
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = meta
+        per_layer_attn_metadata = self._build_base_layer_metadata(cad, B)
 
-        base_layers_only = [n for n in self._draft_attn_layer_names
-                            if "specsteer_base." in n]
-        slot_mapping_dict = {n: slot_mapping_flat for n in base_layers_only}
+        slot_mapping_dict = self._base_slot_mapping_dict(slot_mapping_flat)
 
         with set_forward_context(
             per_layer_attn_metadata, self.vllm_config,
@@ -1065,7 +1283,7 @@ class SpecSteerProposer(DraftModelProposer):
         ):
             ret = self.base_model(
                 input_ids=input_ids_flat,
-                positions=positions_flat,
+                positions=self._hybrid_text_positions(positions_flat),
                 inputs_embeds=None,
             )
             hidden = ret[0] if isinstance(ret, tuple) else ret
@@ -1073,7 +1291,8 @@ class SpecSteerProposer(DraftModelProposer):
         # Slice last K+1 per req, compute logits
         # hidden shape: [B * tpr, H], tpr=K+2
         hidden_reshape = hidden.view(B, tpr, -1)
-        tail_hidden = hidden_reshape[:, 1:, :]  # [B, K+1, H], skip first (warmup)
+        tail_hidden = (hidden_reshape if self._hybrid_specsteer
+                       else hidden_reshape[:, 1:, :])
         tail_flat = tail_hidden.reshape(B * (K + 1), -1)
         logits = self.base_model.compute_logits(tail_flat)
         return logits.view(B, K + 1, -1)
@@ -1207,15 +1426,10 @@ class SpecSteerProposer(DraftModelProposer):
             causal=True, is_prefilling=is_prefilling,
         )
 
-        per_layer_attn_metadata = {}
-        for attn_group in self.draft_attn_groups:
-            # fast_build=True skips AOT scheduler_metadata precompute (FA3
-            # kernel computes internally; safe across N).
-            am = attn_group.get_metadata_builder().build(
-                common_prefix_len=0, common_attn_metadata=cad, fast_build=True,
-            )
-            for n in attn_group.layer_names:
-                per_layer_attn_metadata[n] = am
+        # fast_build=True skips AOT scheduler_metadata precompute (FA3 kernel
+        # computes internally; safe across N). Hybrid groups must still use
+        # their own physical block tables.
+        per_layer_attn_metadata = self._build_drafter_layer_metadata(cad, N)
         drafter_layers = [n for n in self._draft_attn_layer_names
                           if "draft_model." in n]
         slot_mapping_dict = {n: slot_mapping for n in drafter_layers}
@@ -1277,20 +1491,22 @@ class SpecSteerProposer(DraftModelProposer):
 
     @torch.no_grad()
     def _merged_aug_prefill_and_kdecode(
-        self, items: list[tuple[int, list[int]]], K: int,
+        self,
+        items: list[tuple[int, list[int]]],
+        K: int,
+        next_token_ids: torch.Tensor,
     ) -> "torch.Tensor | None":
         """Run full-context drafter prefill plus K incremental decodes.
 
         This merges the bonus and draft-prefill work, saving one full-context
         drafter prefill per speculation step.
 
-        Prefill stage: same as _compute_aug_first_bonus — the drafter
-        forwards aug[0..L-1], computes bonus = argmax(hidden[L-1]).
-        Drafter KV is populated for positions [0..L-1].
+        Prefill stage forwards the full prompt plus every token already
+        committed by the verifier, including ``next_token_ids``. Its last
+        hidden state predicts the first draft token.  The verifier, not the
+        drafter, owns the newly committed token.
 
-        Decode stage: for i in 0..K-1, forward [last_token] at position
-        L+i using the cached KV. Each decode samples one draft token.
-        last_token starts as bonus, then becomes previous draft.
+        Decode stage forwards prior draft tokens only for positions 2..K.
 
         Returns: draft_token_ids of shape (N, K) where N = len(valid items).
         Returns None on failure.
@@ -1314,12 +1530,61 @@ class SpecSteerProposer(DraftModelProposer):
             valid.append((slot, req_idx, aug_ids))
         if not valid:
             return None
+        if next_token_ids.numel() < input_batch.num_reqs:
+            raise RuntimeError("Hybrid SpecSteer is missing verifier next_token_ids")
 
         # === PROFILING: per-phase CUDA events (driven by SPECSTEER_PROFILE) ===
         _PROF = self._profile_enabled
         prof_evts: list[tuple[str, "torch.cuda.Event"]] = []
         if _PROF:
             prof_evts.append(("start", self._profile_event()))
+
+        # A recurrent GDN state cannot be left at the end of an uncommitted
+        # speculative suffix.  The attention-only implementation caches the
+        # full drafter prefill and advances it through K candidates, which is
+        # safe for paged KV (the scheduler rolls the block table forward) but
+        # not for Qwen3.5's in-place recurrent state.  Reconstruct the full
+        # drafter sequence for each hybrid proposal round instead:
+        #
+        #   original full prompt + committed main-path completion
+        #
+        # The main input batch is authoritative for the committed completion;
+        # its prompt prefix is compressed, so only its suffix is appended to
+        # the original/full prompt carried in extra_args.  This deliberately
+        # trades prefill work for exact state semantics until the native
+        # aligned Mamba checkpoint path is used end-to-end by SpecSteer.
+        if self._hybrid_specsteer:
+            rebuilt_valid: list[tuple[int, int, list[int]]] = []
+            prompt_counts = getattr(input_batch, "num_prompt_tokens_cpu_tensor", None)
+            for slot, req_idx, aug_prompt_ids in valid:
+                if prompt_counts is None:
+                    raise RuntimeError(
+                        "Hybrid SpecSteer requires prompt-token bookkeeping "
+                        "to rebuild the drafter GDN state"
+                    )
+                main_prompt_len = int(prompt_counts[req_idx])
+                committed_len = int(input_batch.num_tokens_no_spec[req_idx])
+                if committed_len < main_prompt_len:
+                    raise RuntimeError(
+                        "Hybrid SpecSteer received a committed length before "
+                        "the compressed prompt boundary"
+                    )
+                committed_suffix = input_batch.token_ids_cpu[
+                    req_idx, main_prompt_len:committed_len
+                ].tolist()
+                # ``num_tokens_no_spec`` ends immediately before the target
+                # sampler's just-selected next token.  Append that token once;
+                # replacing it with a drafter prediction breaks the committed
+                # history and was the source of decode-step divergence.
+                verifier_next = int(next_token_ids.view(-1)[req_idx].item())
+                rebuilt_valid.append((
+                    slot, req_idx,
+                    list(aug_prompt_ids) + committed_suffix + [verifier_next],
+                ))
+            valid = rebuilt_valid
+            # A cached prefix ends after speculative candidates, not after the
+            # accepted continuation.  It is invalid by construction for GDN.
+            self._aug_prefilled.clear()
 
         # Per-request lengths and offsets
         Ls = [len(a) for _, _, a in valid]
@@ -1345,7 +1610,10 @@ class SpecSteerProposer(DraftModelProposer):
             L_now = len(aug_ids)
             rid = req_ids_batch[req_idx] if req_idx < len(req_ids_batch) else None
             L_prev = 0
-            cached = self._aug_prefilled.get(rid) if rid else None
+            cached = (
+                None if self._hybrid_specsteer
+                else self._aug_prefilled.get(rid) if rid else None
+            )
             if cached is not None:
                 cached_L, cached_hash = cached
                 # Aug must be append-only relative to the cached prefix.
@@ -1450,15 +1718,16 @@ class SpecSteerProposer(DraftModelProposer):
             causal=True, is_prefilling=is_prefilling,
         )
 
-        per_layer_attn_metadata = {}
-        for attn_group in self.draft_attn_groups:
-            am = attn_group.get_metadata_builder().build(
-                common_prefix_len=0, common_attn_metadata=cad_prefill, fast_build=True,
-            )
-            for n in attn_group.layer_names:
-                per_layer_attn_metadata[n] = am
-        drafter_layers = [n for n in self._draft_attn_layer_names
-                          if "draft_model." in n]
+        per_layer_attn_metadata = self._build_drafter_layer_metadata(
+            cad_prefill, len(valid))
+        # GDN groups consume their group-local recurrent-state indices from
+        # their metadata.  They must never receive token-KV slot mappings.
+        drafter_layers = [
+            n for n in self._draft_full_attn_layer_names
+            if "draft_model." in n
+        ] if self._hybrid_specsteer else [
+            n for n in self._draft_attn_layer_names if "draft_model." in n
+        ]
         slot_mapping_dict = {n: slot_mapping_prefill for n in drafter_layers}
 
         if _PROF: prof_evts.append(("prefill_setup_done", self._profile_event()))
@@ -1486,39 +1755,37 @@ class SpecSteerProposer(DraftModelProposer):
             dh = ret[0] if isinstance(ret, tuple) else ret
         if _PROF: prof_evts.append(("prefill_forward_done", self._profile_event()))
 
-        # bonus per req: argmax at LAST position of each req's incremental slice
-        # = position L_i - 1 in absolute terms = offsets_inc[i+1] - 1 in dh
+        # The last committed verifier token predicts draft position zero.
         last_indices = torch.tensor(
             [offsets_inc[i + 1] - 1 for i in range(len(valid))],
             dtype=torch.int64, device=self.device,
         )
         last_hidden = dh.index_select(0, last_indices)
-        bonus_logits = self.model.compute_logits(last_hidden)
-        bonus_per_req = bonus_logits.argmax(dim=-1)  # (N_valid,) int
+        first_logits = self.model.compute_logits(last_hidden)
+        first_drafts = first_logits.argmax(dim=-1)  # (N_valid,) int
 
         # Update _aug_prefilled high-water mark for next streaming chunk.
         # Store (L, hash) so the next call can verify the cached prefix
         # matches before trusting it (see comment at lookup site).
         for slot, req_idx, aug_ids in valid:
             rid = req_ids_batch[req_idx] if req_idx < len(req_ids_batch) else None
-            if rid:
+            if rid and not self._hybrid_specsteer:
                 self._aug_prefilled[rid] = (
                     len(aug_ids), hash(tuple(aug_ids)),
                 )
         if _PROF: prof_evts.append(("prefill_bonus_done", self._profile_event()))
-        # Trace the full-context drafter's bonus prediction.
-        for j, (_, ri, aug_ids) in enumerate(valid):
-            logger.info(
-                "AsymSpec BONUS: req[%d] L_aug=%d bonus=%d",
-                ri, len(aug_ids), int(bonus_per_req[j].item()),
-            )
+        # The prefill produces draft zero.  Only later draft positions need a
+        # one-token decode.  Keep GDN on the committed-prefix state block
+        # throughout this inner loop; the outer round always re-prefills it.
+        draft_token_ids_list = [first_drafts]
+        self._draft_logits_per_pos.append(first_logits.detach())
+        self._base_logits_per_pos.append(first_logits.detach())
+        last_tokens = first_drafts
+        gdn_anchor_seq_lens = torch.tensor(
+            Ls, dtype=torch.int32, device=self.device,
+        )
 
-        # Run K incremental drafter decodes.
-        # Each iter: input = (N_valid,) tokens, one per req, at position L_i + iter
-        draft_token_ids_list = []  # list of (N_valid,) tensors per iter
-        last_tokens = bonus_per_req  # input for first decode
-
-        for iter_idx in range(K):
+        for iter_idx in range(1, K):
             if _PROF: prof_evts.append((f"k{iter_idx}_start", self._profile_event()))
             # Per-req current position (L_i + iter_idx) and slot
             cur_positions = torch.tensor(
@@ -1564,13 +1831,12 @@ class SpecSteerProposer(DraftModelProposer):
                 slot_mapping=slot_mapping_dec,
                 causal=True, is_prefilling=is_prefilling_iter,
             )
-            per_layer_attn_metadata_dec = {}
-            for attn_group in self.draft_attn_groups:
-                am = attn_group.get_metadata_builder().build_for_drafting(
-                    common_attn_metadata=cad_dec, draft_index=iter_idx,
-                )
-                for n in attn_group.layer_names:
-                    per_layer_attn_metadata_dec[n] = am
+            per_layer_attn_metadata_dec = self._build_drafter_layer_metadata(
+                cad_dec,
+                len(valid),
+                draft_index=iter_idx,
+                gdn_state_seq_lens=gdn_anchor_seq_lens,
+            )
             slot_mapping_dict_dec = {
                 n: slot_mapping_dec for n in drafter_layers
             }
@@ -2284,6 +2550,73 @@ class SpecSteerProposer(DraftModelProposer):
             if token_indices_to_sample is None and len(args) > 4: token_indices_to_sample = args[4]
             if common_attn_metadata is None and len(args) > 5: common_attn_metadata = args[5]
 
+        # Qwen3.5's GDN state is recurrent, not paged token KV.  The native
+        # runner lifecycle deliberately owns verifier state only; letting the
+        # two auxiliary 4B views enter ``super().propose`` leaves their state
+        # after rejected drafts live into the next iteration.  This must run
+        # for *every* hybrid request, including equal-length full/main views.
+        if self._hybrid_specsteer and num_speculative_tokens > 0:
+            if self.runner is None or next_token_ids is None:
+                raise RuntimeError(
+                    "Hybrid SpecSteer requires a runner and verifier next_token_ids"
+                )
+            input_batch = self.runner.input_batch
+            prompt_counts = getattr(input_batch, "num_prompt_tokens_cpu_tensor", None)
+            if prompt_counts is None:
+                raise RuntimeError(
+                    "Hybrid SpecSteer requires prompt-token bookkeeping"
+                )
+            hybrid_items: list[tuple[int, list[int]]] = []
+            for req_idx, req_id in enumerate(input_batch.req_ids[:input_batch.num_reqs]):
+                req = self.runner.requests.get(req_id)
+                full_ids = None
+                if req is not None and req.sampling_params is not None:
+                    extra = req.sampling_params.extra_args
+                    if extra is not None:
+                        full_ids = extra.get("specsteer_aug_prompt_ids")
+                # Preserve direct-engine compatibility: without the serving
+                # extension, the compressed prompt is also the full view.
+                if not full_ids:
+                    main_prompt_len = int(prompt_counts[req_idx])
+                    full_ids = input_batch.token_ids_cpu[
+                        req_idx, :main_prompt_len
+                    ].tolist()
+                hybrid_items.append((req_idx, list(full_ids)))
+
+            draft_token_ids = self._merged_aug_prefill_and_kdecode(
+                hybrid_items,
+                K=num_speculative_tokens,
+                next_token_ids=next_token_ids,
+            )
+            if draft_token_ids is None:
+                raise RuntimeError("Hybrid SpecSteer drafter rebuild failed")
+
+            pv_logits = self._base_parallel_verify(
+                draft_token_ids.reshape(-1), next_token_ids=next_token_ids,
+            )
+            B, K = draft_token_ids.shape
+            if (pv_logits is None or pv_logits.dim() != 3
+                    or pv_logits.shape[0] != B or pv_logits.shape[1] < K):
+                raise RuntimeError(
+                    "Hybrid SpecSteer base rebuild returned invalid logits"
+                )
+            self._base_logits_per_pos = [
+                pv_logits[:, k, :].detach() for k in range(K)
+            ]
+            step = getattr(self, "_pv_step_counter", 0) + 1
+            self._pv_step_counter = step
+            if step <= 3 or step % 20 == 1:
+                aug_l0 = self._draft_logits_per_pos[0][0].view(-1)
+                base_l0 = pv_logits[0, 0]
+                logger.info(
+                    "Hybrid SpecSteer canonical step %d: B=%d K=%d aug=%d base=%d "
+                    "|base-aug|=%.3f",
+                    step, B, K, int(aug_l0.argmax().item()),
+                    int(base_l0.argmax().item()),
+                    float((aug_l0.float() - base_l0.float()).abs().max().item()),
+                )
+            return draft_token_ids
+
         # Stash token_indices_to_sample so _greedy_sample can correctly align
         # base_hidden slicing with drafter's sampled positions. Default (None
         # → last-of-each-request) is covered by the is_first_call fallback
@@ -2470,7 +2803,9 @@ class SpecSteerProposer(DraftModelProposer):
                         items = [(ri, aug_i)
                                  for ri, aug_i, _, _, _ in per_req_aug]
                         merged_drafts = self._merged_aug_prefill_and_kdecode(
-                            items, K=self.num_speculative_tokens,
+                            items,
+                            K=self.num_speculative_tokens,
+                            next_token_ids=next_token_ids,
                         )
                         if merged_drafts is None:
                             raise RuntimeError(
@@ -2499,10 +2834,17 @@ class SpecSteerProposer(DraftModelProposer):
 
                     # At decode step (is_prefill==False is the gate above),
                     # every req has cam.max_query_len tokens (K+1 for spec
-                    # decode parallel verify). target_positions shape (N*tpr,).
-                    # Reshape to (N, tpr) lets us broadcast per-req offsets via
-                    # (N, 1) without building a per-token tensor.
+                    # decode parallel verify).  Ordinary models expose
+                    # positions as (N*tpr,), while Qwen3.5 text uses M-RoPE
+                    # positions shaped (3, N*tpr).  Shift every M-RoPE axis,
+                    # but derive cache slots from its first (text) axis.
                     tpr = common_attn_metadata.max_query_len
+                    is_mrope = target_positions.ndim == 2
+                    if is_mrope:
+                        pos_by_axis = target_positions.view(
+                            target_positions.shape[0], num_reqs, tpr)
+                    else:
+                        pos_by_axis = target_positions.view(num_reqs, tpr)
 
                     if any_offset:
                         seq_dt = common_attn_metadata.seq_lens.dtype
@@ -2511,10 +2853,18 @@ class SpecSteerProposer(DraftModelProposer):
                         # (N, tpr) + (N, 1) → broadcast → flatten to (N*tpr,)
                         # At N=1 reshapes are free views; final tensor is
                         # equivalent to adding one scalar offset at BS=1.
-                        shifted_positions = (
-                            target_positions.view(num_reqs, tpr)
-                            + offsets_gpu.to(target_positions.dtype).view(num_reqs, 1)
-                        ).reshape(-1)
+                        if is_mrope:
+                            shifted_positions = (
+                                pos_by_axis
+                                + offsets_gpu.to(target_positions.dtype).view(
+                                    1, num_reqs, 1)
+                            ).reshape(target_positions.shape[0], -1)
+                        else:
+                            shifted_positions = (
+                                pos_by_axis
+                                + offsets_gpu.to(target_positions.dtype).view(
+                                    num_reqs, 1)
+                            ).reshape(-1)
                         new_cam.seq_lens = common_attn_metadata.seq_lens + offsets_gpu
                         if common_attn_metadata._seq_lens_cpu is not None:
                             offsets_cpu_seq = offsets_cpu.to(
@@ -2529,7 +2879,8 @@ class SpecSteerProposer(DraftModelProposer):
                     else:
                         shifted_positions = target_positions
 
-                    pos_int32 = shifted_positions.to(torch.int32)
+                    pos_int32 = (shifted_positions[0] if is_mrope
+                                 else shifted_positions).to(torch.int32)
 
                     # slot_mapping: single batched gather, no Python loop.
                     # block_table_tensor shape (N, max_blocks); pos_2d (N, tpr).

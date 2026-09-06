@@ -1782,6 +1782,17 @@ class VllmConfig:
                 "connectors or KV offloading; remove the connector/offload "
                 "configuration")
 
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "specsteer"
+            and self.model_config is not None
+            and self.model_config.is_hybrid
+            and self.cache_config.enable_prefix_caching
+        ):
+            raise ValueError(
+                "SpecSteer with hybrid Qwen3.5/GDN models does not support "
+                "prefix caching yet; pass --no-enable-prefix-caching.")
+
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
         #   disables it
@@ -2262,6 +2273,21 @@ class VllmConfig:
 
         if self.model_config.is_hybrid:
             HybridAttentionMambaModelConfig.verify_and_update_config(self)
+            spec_cfg = self.speculative_config
+            if (
+                spec_cfg is not None
+                and spec_cfg.method == "specsteer"
+                and not self.cache_config.enable_prefix_caching
+            ):
+                # Aligned Mamba state is required to commit only accepted
+                # speculative tokens. SpecSteer cannot enable prefix caching
+                # because its full and compressed prompt views differ.
+                self.cache_config.mamba_cache_mode = "align"
+                self.cache_config.mamba_block_size = self.cache_config.block_size
+                logger.info(
+                    "AsymSpec: using aligned Mamba state checkpoints without "
+                    "prefix caching for hybrid SpecSteer"
+                )
 
         if self.model_config.convert_type == "classify":
             # Maybe convert ForCausalLM into ForSequenceClassification model.
@@ -2617,7 +2643,16 @@ class VllmConfig:
             self.cache_config.mamba_block_size is not None
             and self.cache_config.mamba_block_size != self.model_config.max_model_len
         )
-        if mamba_block_size_is_set and not self.cache_config.enable_prefix_caching:
+        specsteer_hybrid_align = bool(
+            self.model_config.is_hybrid
+            and self.speculative_config is not None
+            and self.speculative_config.method == "specsteer"
+        )
+        if (
+            mamba_block_size_is_set
+            and not self.cache_config.enable_prefix_caching
+            and not specsteer_hybrid_align
+        ):
             raise ValueError(
                 "--mamba-block-size can only be set with --enable-prefix-caching"
             )

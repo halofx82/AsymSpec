@@ -61,6 +61,19 @@ view is structurally initialized on the meta device and shares every Parameter
 and registered buffer with the checkpoint-loaded full-context view. Startup
 therefore reads and materializes the 4B checkpoint once.
 
+## Hybrid Qwen3.5 support
+
+Qwen3.5/Qwen3.8 pairs contain both `self_attn` and Gated DeltaNet
+`linear_attn` layers. The integration discovers both layer kinds, keeps their
+runtime state separate between the two 4B views, and sizes every resulting
+cache group by its logical view. Base GDN metadata receives vLLM's native
+accepted-token state and group-local recurrent-state block table; it does not
+treat GDN state as token-linear KV.
+
+Hybrid operation is V1-only and intentionally rejects prefix caching. Use
+`--language-model-only` for conditional-generation checkpoints; the draft
+ModelConfig inherits that setting automatically.
+
 See [`IMPLEMENTATION.md`](IMPLEMENTATION.md) for the KV-cache implementation
 and equivalence argument.
 

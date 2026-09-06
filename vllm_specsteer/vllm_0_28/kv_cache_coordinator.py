@@ -925,10 +925,15 @@ class SpecSteerKVCacheCoordinator(KVCacheCoordinatorNoPrefixCache):
         blocks_per_group = getattr(
             self.kv_cache_config, "num_blocks_per_group", None)
         if blocks_per_group is not None:
-            if self.kv_cache_config.needs_kv_cache_zeroing:
+            # Mamba makes the aggregate config report that zeroing is needed,
+            # but MambaManager does not publish block IDs through the generic
+            # attention-zeroing channel: its recurrent kernels initialize the
+            # selected state slots. Mixed-precision attention does use that
+            # global-ID channel and is unsafe with group-local BlockPools.
+            if self.kv_cache_config.has_mixed_precision_kv_cache:
                 raise ValueError(
                     "AsymSpec asymmetric KV pools require uniform-precision "
-                    "attention KV without cache zeroing")
+                    "attention KV")
             if self.enable_caching:
                 raise ValueError(
                     "AsymSpec asymmetric KV pools do not support prefix caching")
@@ -1032,6 +1037,8 @@ class SpecSteerKVCacheCoordinator(KVCacheCoordinatorNoPrefixCache):
         """
         num_blocks_to_allocate = 0
         for i, manager in enumerate(self.single_type_managers):
+            view_main_tokens = self._view_tokens(
+                i, request_id, num_tokens_main_model)
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
@@ -1051,7 +1058,7 @@ class SpecSteerKVCacheCoordinator(KVCacheCoordinatorNoPrefixCache):
                     new_computed_blocks[i],
                     total_computed_tokens,
                     num_local_computed_tokens,
-                    num_tokens_main_model,
+                    view_main_tokens,
                     apply_admission_cap=apply_admission_cap,
                 )
         return num_blocks_to_allocate
@@ -1071,6 +1078,8 @@ class SpecSteerKVCacheCoordinator(KVCacheCoordinatorNoPrefixCache):
         required = []
         for i, manager in enumerate(self.single_type_managers):
             view_tokens = self._view_tokens(i, request_id, num_tokens)
+            view_main_tokens = self._view_tokens(
+                i, request_id, num_tokens_main_model)
             if view_tokens > self.kv_cache_config.max_model_len_per_group[i]:
                 return [pool.get_num_free_blocks() + 1
                         for pool in self.block_pools]
@@ -1085,7 +1094,7 @@ class SpecSteerKVCacheCoordinator(KVCacheCoordinatorNoPrefixCache):
                 0 if isinstance(manager, CrossAttentionManager)
                 else num_local_computed_tokens,
                 num_encoder_tokens if isinstance(manager, CrossAttentionManager)
-                else num_tokens_main_model,
+                else view_main_tokens,
                 apply_admission_cap=apply_admission_cap,
             ))
         return required
@@ -1133,7 +1142,10 @@ class SpecSteerKVCacheCoordinator(KVCacheCoordinatorNoPrefixCache):
                 num_encoder_tokens
                 if isinstance(manager, CrossAttentionManager)
                 else self._view_tokens(i, request_id, num_tokens),
-                num_tokens_main_model,
+                (num_encoder_tokens
+                 if isinstance(manager, CrossAttentionManager)
+                 else self._view_tokens(
+                     i, request_id, num_tokens_main_model)),
             )
             for i, manager in enumerate(self.single_type_managers)
         )

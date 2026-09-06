@@ -120,13 +120,13 @@ E5_NEW = """        logits = self.model.compute_logits(last_hidden)
         else:
             argmax_per_req = logits.argmax(dim=-1).tolist()"""
 
-F1_OLD = """        bonus_logits = self.model.compute_logits(last_hidden)
-        bonus_per_req = bonus_logits.argmax(dim=-1)  # (N_valid,) int"""
-F1_NEW = """        bonus_logits = self.model.compute_logits(last_hidden)
+F1_OLD = """        first_logits = self.model.compute_logits(last_hidden)
+        first_drafts = first_logits.argmax(dim=-1)  # (N_valid,) int"""
+F1_NEW = """        first_logits = self.model.compute_logits(last_hidden)
         if getattr(self, "_hetero", False):
-            bonus_logits = bonus_logits.masked_fill(
+            first_logits = first_logits.masked_fill(
                 self._h_suppress_a.unsqueeze(0), float("-inf"))
-        bonus_per_req = bonus_logits.argmax(dim=-1)  # drafter-space ids"""
+        first_drafts = first_logits.argmax(dim=-1)  # drafter-space ids"""
 
 F2_OLD = """            new_drafts = draft_logits.argmax(dim=-1)  # (N_valid,) int"""
 F2_NEW = """            sample_logits = draft_logits
@@ -151,7 +151,16 @@ F4_OLD = """                if getattr(self, "_use_fast_base_fwd", False):"""
 F4_NEW = """                if (getattr(self, "_use_fast_base_fwd", False)
                         and not getattr(self, "_hetero", False)):"""
 
-E4_OLD = """            if req_id_i not in self._base_prefilled:
+E4_OLD = """            if self._hybrid_specsteer:
+                # GDN recurrent state cannot safely use the attention-only
+                # rewrite/rollback protocol below. Rebuild the compressed
+                # sequence through vLLM's ordinary GDN prefill path for each
+                # verification round. This is deliberately conservative but
+                # gives the base exact compressed-context logits and leaves no
+                # rejected speculative suffix in its recurrent state.
+                start_pos_i = 0
+                input_tokens_i = list(token_ids_i) + nt_list + drafts_per_req[i]
+            elif req_id_i not in self._base_prefilled:
                 start_pos_i = 0
                 input_tokens_i = (
                     list(token_ids_i) + nt_list + drafts_per_req[i]
@@ -164,7 +173,16 @@ E4_OLD = """            if req_id_i not in self._base_prefilled:
                 input_tokens_i = (
                     [int(token_ids_i[-1])] + nt_list + drafts_per_req[i]
                 )"""
-E4_NEW = """            if req_id_i not in self._base_prefilled:
+E4_NEW = """            if self._hybrid_specsteer:
+                # GDN recurrent state cannot safely use the attention-only
+                # rewrite/rollback protocol below. Rebuild the compressed
+                # sequence through vLLM's ordinary GDN prefill path for each
+                # verification round. This is deliberately conservative but
+                # gives the base exact compressed-context logits and leaves no
+                # rejected speculative suffix in its recurrent state.
+                start_pos_i = 0
+                input_tokens_i = list(token_ids_i) + nt_list + drafts_per_req[i]
+            elif req_id_i not in self._base_prefilled:
                 start_pos_i = 0
                 if getattr(self, "_hetero", False):
                     # HETERO E4a: base prefix = drafter-tokenizer encoding of
