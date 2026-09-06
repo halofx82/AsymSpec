@@ -38,6 +38,8 @@ def main() -> None:
                         help="JSON array passed unchanged to the Qwen chat template")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--num-speculative-tokens", type=int, default=2,
+                        help="SpecSteer K for --mode strict-target")
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--max-model-len", type=int, default=40960)
     parser.add_argument("--main-max-model-len", type=int, default=8192)
@@ -45,6 +47,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_tokens <= 0:
         parser.error("--max-tokens must be positive")
+    if args.num_speculative_tokens <= 0:
+        parser.error("--num-speculative-tokens must be positive")
 
     # The strict run deliberately uses the same rendered prompt on both paths:
     # this isolates target verification from context-compression differences.
@@ -70,7 +74,7 @@ def main() -> None:
             speculative_config={
                 "method": "specsteer",
                 "model": DRAFTER,
-                "num_speculative_tokens": 2,
+                "num_speculative_tokens": args.num_speculative_tokens,
                 "draft_tensor_parallel_size": args.tp,
                 "specsteer_beta": 1.0,
                 "specsteer_gamma": 0.5,
@@ -85,7 +89,9 @@ def main() -> None:
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True)
     prompt_ids = list(tokenizer.encode(prompt, add_special_tokens=False))
-    if args.mode == "strict-target" and len(prompt_ids) + args.max_tokens + 2 > args.main_max_model_len:
+    if (args.mode == "strict-target"
+            and len(prompt_ids) + args.max_tokens + args.num_speculative_tokens
+            > args.main_max_model_len):
         parser.error("prompt + completion + K exceeds --main-max-model-len")
     sampling_kwargs = {"temperature": 0, "max_tokens": args.max_tokens}
     if args.mode == "strict-target":

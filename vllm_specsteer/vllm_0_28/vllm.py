@@ -2279,14 +2279,28 @@ class VllmConfig:
                 and spec_cfg.method == "specsteer"
                 and not self.cache_config.enable_prefix_caching
             ):
-                # Aligned Mamba state is required to commit only accepted
-                # speculative tokens. SpecSteer cannot enable prefix caching
-                # because its full and compressed prompt views differ.
-                self.cache_config.mamba_cache_mode = "align"
-                self.cache_config.mamba_block_size = self.cache_config.block_size
+                # Prefix caching is deliberately disabled for SpecSteer: its
+                # target and drafter prompts are different views.  Keep the
+                # existing aligned behavior by default while the compact
+                # native ``none`` layout is evaluated diagnostically.  None
+                # uses the GDN kernels' per-request 1 + K state slots.
+                requested_mamba_mode = os.environ.get(
+                    "ASYMSPEC_MAMBA_CACHE_MODE", "align"
+                ).lower()
+                if requested_mamba_mode not in ("none", "align"):
+                    raise ValueError(
+                        "ASYMSPEC_MAMBA_CACHE_MODE must be 'none' or 'align' "
+                        f"(got {requested_mamba_mode!r})"
+                    )
+                self.cache_config.mamba_cache_mode = requested_mamba_mode
+                if requested_mamba_mode == "align":
+                    # This is only the legacy diagnostic path. Align requires
+                    # a concrete state-block size even without APC.
+                    self.cache_config.mamba_block_size = self.cache_config.block_size
                 logger.info(
-                    "AsymSpec: using aligned Mamba state checkpoints without "
-                    "prefix caching for hybrid SpecSteer"
+                    "AsymSpec: hybrid SpecSteer Mamba cache mode=%s "
+                    "(prefix caching remains disabled)",
+                    requested_mamba_mode,
                 )
 
         if self.model_config.convert_type == "classify":

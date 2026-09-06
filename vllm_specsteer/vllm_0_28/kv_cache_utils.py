@@ -1381,23 +1381,27 @@ def get_kv_cache_config_from_groups(
             limit = (vllm_config.model_config.max_model_len
                      if is_drafter else main_limit)
             limits.append(limit)
-            # BlockPool permanently reserves block zero as its null block.
-            # Hybrid Mamba/GDN groups additionally require native vLLM
-            # speculative-state checkpoint blocks.  They are not part of a
-            # token-linear context window, but MambaManager allocates them on
-            # the first prefill so an otherwise empty pool must reserve them.
-            # Without this, a short request is permanently admission-blocked
-            # (one usable block but one running-state plus checkpoint needed).
-            mamba_checkpoint_blocks = (
-                group.kv_cache_spec.num_speculative_blocks
-                if isinstance(group.kv_cache_spec, MambaSpec)
-                else 0
-            )
-            num_blocks = (
-                cdiv(limit, group.kv_cache_spec.block_size)
-                + 1
-                + mamba_checkpoint_blocks
-            )
+            # Mamba's compact native ``none`` mode owns exactly one running
+            # state plus K speculative state slots per active request.  It is
+            # not a token-linear KV cache.  Keep an extra physical null page
+            # for BlockPool's reserved block zero.  Align remains position
+            # indexed and therefore retains the old context-sized allocation.
+            if (
+                isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.mamba_cache_mode == "none"
+            ):
+                num_blocks = 2 + group.kv_cache_spec.num_speculative_blocks
+            else:
+                mamba_checkpoint_blocks = (
+                    group.kv_cache_spec.num_speculative_blocks
+                    if isinstance(group.kv_cache_spec, MambaSpec)
+                    else 0
+                )
+                num_blocks = (
+                    cdiv(limit, group.kv_cache_spec.block_size)
+                    + 1
+                    + mamba_checkpoint_blocks
+                )
             blocks_per_group.append(num_blocks)
             per_layer_specs = (
                 group.kv_cache_spec.kv_cache_specs

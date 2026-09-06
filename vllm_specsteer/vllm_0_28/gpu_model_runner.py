@@ -1015,6 +1015,12 @@ class GPUModelRunner(
             and self.cache_config.mamba_cache_mode == "align"
             and not self.cache_config.enable_prefix_caching
         )
+        self._specsteer_verifier_mamba = bool(
+            self.speculative_config is not None
+            and self.speculative_config.method == "specsteer"
+            and self.model_config.is_hybrid
+            and not self.cache_config.enable_prefix_caching
+        )
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
@@ -1800,6 +1806,81 @@ class GPUModelRunner(
                         "verifier_block_ids": blocks,
                     }
                     handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            logger.warning_once("Unable to write ASYMSPEC_VERIFIER_STATE_LOG")
+
+    def _log_specsteer_verifier_gdn_metadata(
+        self, attn_metadata: PerLayerAttnMetadata, num_reqs: int
+    ) -> None:
+        """Log native GDN inputs for one verifier forward when requested.
+
+        This deliberately reads metadata only after native builders have
+        produced it.  It does not modify state, scheduling, or sampling.
+        """
+        path = os.environ.get("ASYMSPEC_VERIFIER_STATE_LOG")
+        if not path or not self._specsteer_verifier_mamba:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        if not isinstance(attn_metadata, dict):
+            return
+        verifier_layers: list[str] = []
+        for group in self.kv_cache_config.kv_cache_groups:
+            if not isinstance(group.kv_cache_spec, MambaSpec):
+                continue
+            if any(is_auxiliary_state_layer(name) for name in group.layer_names):
+                continue
+            verifier_layers.extend(group.layer_names)
+        if not verifier_layers:
+            return
+        # Every layer within a GDN group shares one metadata object.  Log the
+        # outer pair to catch accidental group mixing without dumping tensors.
+        selected = [verifier_layers[0], verifier_layers[-1]]
+        records: dict[str, object] = {}
+        for name in selected:
+            metadata = attn_metadata.get(name)
+            if metadata is None:
+                continue
+            state_indices = getattr(metadata, "spec_state_indices_tensor", None)
+            accepted = getattr(metadata, "num_accepted_tokens", None)
+            query_start = getattr(metadata, "spec_query_start_loc", None)
+            if state_indices is None or accepted is None:
+                continue
+            records[name] = {
+                "state_indices": state_indices[:num_reqs].cpu().tolist(),
+                "num_accepted_tokens": accepted[:num_reqs].cpu().tolist(),
+                "query_start_loc": (
+                    None if query_start is None else query_start.cpu().tolist()
+                ),
+                "num_spec_decodes": getattr(metadata, "num_spec_decodes", None),
+                "num_actual_tokens": getattr(metadata, "num_actual_tokens", None),
+            }
+        if not records:
+            return
+        previous = self.input_batch.num_accepted_tokens_cpu[:num_reqs].tolist()
+        passed = self.num_accepted_tokens.gpu[:num_reqs].cpu().tolist()
+        seen = next(iter(records.values()))["num_accepted_tokens"]  # type: ignore[index]
+        generated_positions = [
+            len(self.requests[req_id].output_token_ids)
+            for req_id in self.input_batch.req_ids[:num_reqs]
+        ]
+        if self.cache_config.mamba_cache_mode == "none" and num_reqs == 1:
+            assert previous == passed == seen, (
+                "SpecSteer none-mode GDN acceptance handoff diverged: "
+                f"previous={previous}, passed={passed}, seen={seen}"
+            )
+        record = {
+            "phase": "gdn_metadata",
+            "mamba_cache_mode": self.cache_config.mamba_cache_mode,
+            "generated_positions": generated_positions,
+            "accepted_count_from_previous_sampler": previous,
+            "accepted_count_passed_to_metadata_builder": passed,
+            "accepted_count_seen_by_gdn_metadata": seen,
+            "layers": records,
+        }
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
         except OSError:
             logger.warning_once("Unable to write ASYMSPEC_VERIFIER_STATE_LOG")
 
@@ -2813,6 +2894,7 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
 
+        self._log_specsteer_verifier_gdn_metadata(attn_metadata, num_reqs)
         return attn_metadata, spec_decode_common_attn_metadata
 
     def _compute_cascade_attn_prefix_lens(
