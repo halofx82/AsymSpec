@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import json
+import os
 import threading
 import time
 from collections import defaultdict
@@ -213,6 +215,7 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
+from vllm.v1.worker import specsteer_mamba_utils
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
@@ -1149,32 +1152,20 @@ class GPUModelRunner(
                     raise RuntimeError(
                         "Hybrid SpecSteer did not register a verifier GDN group"
                     )
-                reference = verifier_specs[0]
-                if not all(spec == reference for spec in verifier_specs):
-                    raise RuntimeError(
-                        "Hybrid SpecSteer verifier GDN groups must have one "
-                        "uniform MambaSpec"
-                    )
-                copy_funcs = self.model.get_mamba_state_copy_func()
-                entries_per_req = sum(
-                    len(self.kv_cache_config.kv_cache_groups[gid].layer_names)
-                    for gid in verifier_group_ids
-                ) * len(copy_funcs)
-                n = self.max_num_reqs * entries_per_req
-                copy_buffers = mamba_utils.MambaCopyBuffers(
-                    src_ptrs=self._make_buffer(n, dtype=torch.uint64),
-                    dst_ptrs=self._make_buffer(n, dtype=torch.uint64),
-                    sizes=self._make_buffer(n, dtype=torch.int32),
+                self._mamba_bufs = specsteer_mamba_utils.create_for_groups(
+                    max_num_reqs=self.max_num_reqs,
+                    kv_cache_config=self.kv_cache_config,
+                    copy_funcs=self.model.get_mamba_state_copy_func(),
+                    make_buffer=self._make_buffer,
+                    device=self.device,
                     mamba_group_ids=verifier_group_ids,
-                    mamba_spec=reference,
+                    with_postprocess_align=True,
                 )
-                self._mamba_bufs = mamba_utils.MambaBuffers(
-                    preprocess=copy_buffers,
-                    # The fused context assumes all Mamba groups and one
-                    # block-table stride. The verifier-only CPU copy path is
-                    # exact and leaves the other two logical views untouched.
-                    postprocess_align=None,
-                )
+                assert self._mamba_bufs.postprocess_align is not None
+                assert (self._mamba_bufs.preprocess.mamba_group_ids
+                        == verifier_group_ids)
+                assert (self._mamba_bufs.postprocess_align.mamba_group_ids
+                        == verifier_group_ids)
                 logger.info(
                     "AsymSpec verifier-only aligned Mamba lifecycle: gids=%s",
                     verifier_group_ids,
@@ -1719,6 +1710,8 @@ class GPUModelRunner(
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
             # pre-staged to GPU buffers in _prepare_inputs.
             mamba_bufs = self._get_mamba_bufs()
+            self._log_specsteer_verifier_state(
+                "before_postprocess", scheduler_output, num_reqs)
             if mamba_bufs.postprocess_align is not None:
                 mamba_utils.postprocess_mamba_align_gpu(
                     bufs=mamba_bufs,
@@ -1733,12 +1726,13 @@ class GPUModelRunner(
                     mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
                 )
             else:
-                # Non-fused aligned path: next iteration's preprocess copies
-                # the selected accepted state independently for each Mamba
-                # group.  Preserve vLLM's accepted-token handoff exactly.
+                # Non-speculative hybrid fallback retains native vLLM's
+                # accepted-token handoff behavior.
                 self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                     self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                 )
+            self._log_specsteer_verifier_state(
+                "after_postprocess", scheduler_output, num_reqs)
 
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
@@ -1759,6 +1753,55 @@ class GPUModelRunner(
                     self.num_spec_tokens,
                     num_reqs,
                 )
+
+    def _log_specsteer_verifier_state(
+        self,
+        phase: str,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+    ) -> None:
+        """Debug-only state-lifecycle records; never read model logits."""
+        path = os.environ.get("ASYMSPEC_VERIFIER_STATE_LOG")
+        if not path or not self._specsteer_verifier_mamba_align:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        mamba_bufs = self._get_mamba_bufs()
+        gids = mamba_bufs.preprocess.mamba_group_ids
+        scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    req = self.requests[req_id]
+                    blocks = {
+                        str(gid): self.input_batch.block_table[gid].block_table.np[
+                            row,
+                            :self.input_batch.block_table[gid].num_blocks_per_row[row],
+                        ].tolist()
+                        for gid in gids
+                    }
+                    accepted = int(self.input_batch.num_accepted_tokens_cpu[row])
+                    accepted_gpu = int(self.num_accepted_tokens.gpu[row].item())
+                    record = {
+                        "phase": phase,
+                        "request_index": row,
+                        "generated_position": len(req.output_token_ids),
+                        "num_computed_tokens": req.num_computed_tokens,
+                        "input_batch_num_computed_tokens": int(
+                            self.input_batch.num_computed_tokens_cpu[row]),
+                        "num_scheduled_tokens": int(
+                            scheduler_output.num_scheduled_tokens.get(req_id, 0)),
+                        "num_draft_tokens": len(scheduled_drafts.get(req_id, [])),
+                        "num_accepted_tokens_cpu": accepted,
+                        "num_accepted_tokens_gpu": accepted_gpu,
+                        "mamba_state_idx": self.mamba_state_idx.get(req_id),
+                        "mamba_block_size": mamba_bufs.preprocess.mamba_spec.block_size,
+                        "verifier_mamba_group_ids": gids,
+                        "verifier_block_ids": blocks,
+                    }
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            logger.warning_once("Unable to write ASYMSPEC_VERIFIER_STATE_LOG")
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -3965,23 +4008,26 @@ class GPUModelRunner(
                 "result-writer filtering before reporting paper numbers."
             )
 
-        # Diagnostic: log |δ| at position 0 once per 50 steps.
-        if not hasattr(self.drafter, "_diag_count"):
-            self.drafter._diag_count = 0
-        self.drafter._diag_count += 1
-        if self.drafter._diag_count % 50 == 1:
-            import torch.nn.functional as _F
-            _a = _F.log_softmax(aug_logits[0].float(), dim=-1)
-            _b = _F.log_softmax(base_logits[0].float(), dim=-1)
-            _dmx = (_a - _b).abs().max().item()
-            _dmn = (_a - _b).abs().mean().item()
-            logger.info(
-                "SpecSteer diag #%d: |δ|_max=%.4f |δ|_mean=%.6f  "
-                "aug_top1=%d base_top1=%d draft=%d",
-                self.drafter._diag_count, _dmx, _dmn,
-                int(_a.argmax().item()), int(_b.argmax().item()),
-                int(metadata.draft_token_ids[0].item()),
-            )
+        # Diagnostic: log |δ| at position 0 once per 50 steps. Strict target
+        # verification must not calculate probabilities or deltas from either
+        # 4B view; its sampler consumes target logits and draft token IDs only.
+        if os.environ.get("ASYMSPEC_METHOD", "gamma_rule") != "strict_target":
+            if not hasattr(self.drafter, "_diag_count"):
+                self.drafter._diag_count = 0
+            self.drafter._diag_count += 1
+            if self.drafter._diag_count % 50 == 1:
+                import torch.nn.functional as _F
+                _a = _F.log_softmax(aug_logits[0].float(), dim=-1)
+                _b = _F.log_softmax(base_logits[0].float(), dim=-1)
+                _dmx = (_a - _b).abs().max().item()
+                _dmn = (_a - _b).abs().mean().item()
+                logger.info(
+                    "SpecSteer diag #%d: |δ|_max=%.4f |δ|_mean=%.6f  "
+                    "aug_top1=%d base_top1=%d draft=%d",
+                    self.drafter._diag_count, _dmx, _dmn,
+                    int(_a.argmax().item()), int(_b.argmax().item()),
+                    int(metadata.draft_token_ids[0].item()),
+                )
 
         output_token_ids = specsteer_greedy_sample(
             draft_token_ids=metadata.draft_token_ids,
@@ -4657,11 +4703,19 @@ class GPUModelRunner(
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
                 if self._specsteer_verifier_mamba_align:
-                    # `preprocess_mamba` only uses this flag for its upstream
-                    # align-mode assertion.  Scheduler prefix caching remains
-                    # disabled before and after the state-copy operation.
-                    self.cache_config.enable_prefix_caching = True
-                try:
+                    specsteer_mamba_utils.preprocess_for_specsteer_verifier(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        mamba_bufs.preprocess,
+                        mamba_bufs.postprocess_align,
+                    )
+                else:
                     mamba_utils.preprocess_mamba(
                         scheduler_output,
                         self.kv_cache_config,
@@ -4674,9 +4728,6 @@ class GPUModelRunner(
                         mamba_bufs.preprocess,
                         align_ctx=mamba_bufs.postprocess_align,
                     )
-                finally:
-                    if self._specsteer_verifier_mamba_align:
-                        self.cache_config.enable_prefix_caching = False
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
                 # Re-sync to GPU so the mamba kernel reads from the

@@ -13,6 +13,11 @@
       "upstream_sha256": "7f2890eefca1efe25565bf1c7e5906a87948ae922610a7aaac620b28b46f26aa"
     },
     {
+      "source": "specsteer_mamba_utils.py",
+      "target": "v1/worker/specsteer_mamba_utils.py",
+      "upstream_sha256": null
+    },
+    {
       "source": "vllm.py",
       "target": "config/vllm.py",
       "upstream_sha256": "fb07f95658ae0ee6e6c16c0f36e90f9179e8761221a45d4bf1aebe8bcf63cdcb"

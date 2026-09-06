@@ -12,6 +12,8 @@
 #                 λ_eff = 1/log(V) ≈ 0.096 for V=32000; zero free parameters
 #   cma_hbase   — γ_eff = γ·exp(-KL/H(p_base)); normalizes by per-position base entropy
 #                 position-adaptive: lenient when base is uncertain, strict when confident
+#   strict_target — ordinary greedy target verification. A draft token is
+#                   committed only when it equals the verifier top-1 token.
 #
 # δ-source ablation (ASYMSPEC_DELTA_SRC env var, default "ours"):
 #   ours     — δ = log_softmax(aug) - log_softmax(base)  [contrastive cross-context; default]
@@ -46,7 +48,9 @@ def specsteer_greedy_sample(
 ) -> torch.Tensor:
     """Greedy γ-rule + δ-fusion with optional CMA/JSD acceptance.
 
-    Mode: env var ASYMSPEC_METHOD ∈ {gamma_rule, cma, jsd, jsd_pos}.
+    Mode: env var ASYMSPEC_METHOD includes the delta-fusion modes below and
+    ``strict_target``. The latter is a diagnostic oracle: it deliberately
+    ignores beta, gamma, augmented logits, and base logits.
 
     CMA knobs (env vars):
         CMA_LAMBDA       (default 1.0)  — KL scale for cma method
@@ -55,7 +59,8 @@ def specsteer_greedy_sample(
         ASYMSPEC_DELTA_SRC (default ours) — δ construction: ours|raw_aug|scd
     """
     method = os.environ.get("ASYMSPEC_METHOD", "gamma_rule")
-    assert method in {"gamma_rule", "cma", "jsd", "jsd_pos", "cma_vnorm", "cma_hbase"}, method
+    assert method in {"gamma_rule", "cma", "jsd", "jsd_pos", "cma_vnorm",
+                      "cma_hbase", "strict_target"}, method
 
     assert draft_token_ids.ndim == 1
     assert target_logits.ndim == aug_logits.ndim == base_logits.ndim == 2
@@ -63,6 +68,32 @@ def specsteer_greedy_sample(
     batch_size = len(num_draft_tokens)
     num_tokens, vocab_size = target_logits.shape
     device = target_logits.device
+
+    # This is intentionally before every delta/probability calculation. It is
+    # the target-only greedy-speculation oracle used to validate the verifier
+    # path: a 4B proposal has no authority unless it is exactly target top-1.
+    if method == "strict_target":
+        target_argmax = target_logits.argmax(dim=-1).to(torch.int32)
+        output_token_ids = torch.full(
+            (batch_size, max_spec_len + 1),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32, device=device,
+        )
+        strict_target_kernel[(batch_size,)](
+            output_token_ids, cu_num_draft_tokens, draft_token_ids,
+            target_argmax, bonus_token_ids, max_spec_len,
+        )
+        _slog = os.environ.get("ASYMSPEC_STRICT_DIAG_LOG", "")
+        if _slog:
+            _log_strict_target(_slog, output_token_ids, draft_token_ids,
+                               target_argmax, num_draft_tokens,
+                               cu_num_draft_tokens, bonus_token_ids)
+        _plog = os.environ.get("ASYMSPEC_PROVENANCE_LOG", "")
+        if _plog:
+            _log_provenance(_plog, method, output_token_ids, draft_token_ids,
+                            num_draft_tokens, cu_num_draft_tokens,
+                            bonus_token_ids)
+        return output_token_ids
 
     # Work in fp32; kernels are memory-bound.
     t_log = torch.log_softmax(target_logits.float(), dim=-1)
@@ -264,7 +295,122 @@ def _log_provenance(path, method, out_ids, draft_ids, num_draft, cu, bonus):
         pass   # never let instrumentation perturb decoding
 
 
+def _log_strict_target(path, out_ids, draft_ids, target_argmax, num_draft,
+                       cu, bonus):
+    """Append target-only verification decisions without affecting sampling.
+
+    The kernel remains the authority. This deliberately reconstructs its
+    already-committed decisions after the fact, and is isolated behind an env
+    variable because moving tensors to the host is diagnostic overhead.
+    """
+    try:
+        import json as _json
+        out = out_ids.tolist()
+        draft = draft_ids.tolist()
+        top1 = target_argmax.tolist()
+        cumulative = cu.tolist()
+        bonuses = bonus.reshape(-1).tolist()
+        with open(path, "a") as f:
+            for req_idx, count in enumerate(num_draft):
+                n = int(count)
+                start = 0 if req_idx == 0 else int(cumulative[req_idx - 1])
+                positions = []
+                first_mismatch = None
+                matches = 0
+                for pos in range(n):
+                    d = int(draft[start + pos])
+                    t = int(top1[start + pos])
+                    match = d == t
+                    if match and first_mismatch is None:
+                        matches += 1
+                    elif first_mismatch is None:
+                        first_mismatch = pos
+                    # Positions after a mismatch are intentionally recorded as
+                    # uninspected: their target logits are not valid decisions.
+                    inspected = first_mismatch is None or first_mismatch == pos
+                    if inspected:
+                        emitted = int(out[req_idx][pos])
+                        positions.append({"pos": pos, "draft": d,
+                                          "target_top1": t, "match": match,
+                                          "emitted": emitted})
+                    else:
+                        break
+                all_match = first_mismatch is None
+                f.write(_json.dumps({
+                    "method": "strict_target",
+                    "request_index": req_idx,
+                    "num_draft_tokens": n,
+                    "num_target_top1_matches": matches,
+                    "first_mismatch_position": first_mismatch,
+                    "all_drafts_match": all_match,
+                    "bonus_emitted": all_match
+                    and int(out[req_idx][n]) != PLACEHOLDER_TOKEN_ID,
+                    "bonus_token_id": int(bonuses[req_idx]) if all_match else None,
+                    "positions": positions,
+                }) + "\n")
+    except Exception:
+        pass  # diagnostics must never perturb decoding
+
+
+def strict_target_reference(
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: list[int],
+    max_spec_len: int,
+    target_logits: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """CPU/GPU reference for strict target semantics, used by unit tests.
+
+    This is not used in production; the Triton kernel below is. Keeping the
+    reference torch-only makes the target-only contract testable without CUDA.
+    """
+    target_top1 = target_logits.argmax(dim=-1)
+    result = torch.full((len(num_draft_tokens), max_spec_len + 1),
+                        PLACEHOLDER_TOKEN_ID, dtype=torch.int32,
+                        device=target_logits.device)
+    start = 0
+    for req_idx, count in enumerate(num_draft_tokens):
+        for pos in range(count):
+            token_idx = start + pos
+            draft = draft_token_ids[token_idx].to(torch.int32)
+            target = target_top1[token_idx].to(torch.int32)
+            result[req_idx, pos] = draft if draft == target else target
+            if draft != target:
+                break
+        else:
+            result[req_idx, count] = bonus_token_ids.reshape(-1)[req_idx]
+        start += count
+    return result
+
+
 # ── Triton kernels ────────────────────────────────────────────────────────────
+
+@triton.jit(do_not_specialize=["max_spec_len"])
+def strict_target_kernel(
+    output_token_ids_ptr, cu_num_draft_tokens_ptr, draft_token_ids_ptr,
+    target_argmax_ptr, bonus_token_ids_ptr, max_spec_len,
+):
+    """Greedy target verification; stop immediately at the first mismatch."""
+    req_idx = tl.program_id(0)
+    start_idx = 0 if req_idx == 0 else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    num_draft_tokens = end_idx - start_idx
+    rejected = False
+    for pos in range(num_draft_tokens):
+        if not rejected:
+            draft = tl.load(draft_token_ids_ptr + start_idx + pos)
+            target = tl.load(target_argmax_ptr + start_idx + pos)
+            if draft == target:
+                tl.store(output_token_ids_ptr
+                         + req_idx * (max_spec_len + 1) + pos, draft)
+            else:
+                tl.store(output_token_ids_ptr
+                         + req_idx * (max_spec_len + 1) + pos, target)
+                rejected = True
+    if not rejected:
+        bonus = tl.load(bonus_token_ids_ptr + req_idx)
+        tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1)
+                 + num_draft_tokens, bonus)
 
 @triton.jit(do_not_specialize=["max_spec_len"])
 def cma_kernel(

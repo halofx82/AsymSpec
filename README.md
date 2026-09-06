@@ -206,6 +206,61 @@ The same language-only setting is propagated to the 4B draft ModelConfig. The
 full drafter groups use `max_model_len`; compressed verifier/base groups use
 `specsteer_main_max_model_len`. Hybrid prefix caching is rejected explicitly.
 
+#### Verifier strict-target diagnostic
+
+Before interpreting hybrid-pair output quality, validate the 27B verifier with
+target-only greedy speculative decoding. It retains 4B proposals for scheduling
+but commits a proposal only when it equals the 27B verifier's top-1 token;
+otherwise it commits that verifier token and stops the speculative block.
+
+```bash
+export ASYMSPEC_METHOD=strict_target
+export ASYMSPEC_STRICT_DIAG_LOG="$PWD/outputs/strict-target.jsonl"
+```
+
+For a text-chat capture, put the same messages in `messages.json`, then run the
+two commands separately (never concurrently):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/capture_strict_target.py \
+  --mode target --messages messages.json --out outputs/target-greedy.json \
+  --max-tokens 256
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 ASYMSPEC_STRICT_DIAG_LOG="$PWD/outputs/strict-target.jsonl" \
+  python scripts/capture_strict_target.py \
+  --mode strict-target --messages messages.json --out outputs/strict-target.json \
+  --max-tokens 256
+```
+
+The capture tool renders the same Qwen chat template and deliberately supplies
+the same prompt IDs to strict target's compressed and full paths, isolating
+verifier correctness from compression. It writes one JSON object per run:
+
+```json
+{"generated_token_ids": [123, 456], "generated_text": "..."}
+```
+
+Token IDs—not decoded text—are the oracle:
+
+```bash
+python scripts/check_strict_target.py \
+  --target outputs/target-greedy.json \
+  --asymspec outputs/strict-target.json
+```
+
+The command reports the common prefix and first divergent token, and exits
+nonzero on any difference. `ASYMSPEC_STRICT_DIAG_LOG` appends one record per
+request/speculative block without prompt contents, e.g.
+
+```json
+{"method":"strict_target","request_index":0,"num_draft_tokens":2,"num_target_top1_matches":1,"first_mismatch_position":1,"all_drafts_match":false,"bonus_emitted":false,"bonus_token_id":null,"positions":[{"pos":0,"draft":123,"target_top1":123,"match":true,"emitted":123},{"pos":1,"draft":456,"target_top1":789,"match":false,"emitted":789}]}
+```
+
+An A-vs-B mismatch is evidence to investigate the verifier/cache path; do not
+attribute it to decoded-text differences or to the JSD sampler. Deterministic
+execution settings (V1, eager mode, fixed seed, no concurrent batching) should
+be held constant. The normal `jsd` mode remains a separate quality comparison.
+
 ```bash
 export ASYMSPEC_METHOD=jsd
 export ASYMSPEC_DELTA_SRC=ours

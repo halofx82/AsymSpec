@@ -12,6 +12,20 @@ from vllm.v1.sample.specsteer_sampler import specsteer_greedy_sample
 
 
 def reference(drafts, counts, target, aug, base, bonus, method, source, gamma):
+    if method == 'strict_target':
+        out = torch.full((len(counts), max(counts)+1), -1, dtype=torch.int32)
+        top1 = target.argmax(-1)
+        start = 0
+        for req, count in enumerate(counts):
+            for pos in range(count):
+                j = start + pos
+                out[req, pos] = int(drafts[j]) if drafts[j] == top1[j] else top1[j]
+                if drafts[j] != top1[j]:
+                    break
+            else:
+                out[req, count] = bonus[req]
+            start += count
+        return out
     t, a, b = [torch.log_softmax(x.double().cpu(), -1) for x in (target, aug, base)]
     delta = {'ours': a-b, 'raw_aug': a, 'scd': t-b}[source]
     fused = (t + delta).argmax(-1)
@@ -48,7 +62,8 @@ def main():
         target, aug, base = [torch.randn(n, 17, generator=generator).cuda() for _ in range(3)]
         drafts = aug.argmax(-1)
         cu = torch.tensor(counts, device='cuda', dtype=torch.int32).cumsum(0).int()
-        for method in ('gamma_rule', 'cma', 'jsd', 'jsd_pos', 'cma_vnorm', 'cma_hbase'):
+        for method in ('gamma_rule', 'cma', 'jsd', 'jsd_pos', 'cma_vnorm', 'cma_hbase',
+                       'strict_target'):
             for source in ('ours', 'raw_aug', 'scd'):
                 for gamma in (0., .5, 100.):
                     for bonus_value in (3, -1):
@@ -68,7 +83,23 @@ def main():
             torch.tensor([1], dtype=torch.int32, device='cuda'), same, same, same,
             torch.tensor([[2]], dtype=torch.int32, device='cuda'), gamma=1.)
         assert out.cpu().tolist() == [[0, -1]]
-    print(f'PASS: {checked} sampler reference cases and strict-threshold equality')
+    # strict_target must be completely independent of beta/gamma and of the
+    # auxiliary 4B views. This invokes the Triton kernel, unlike the CPU unit
+    # reference tests above.
+    target = torch.tensor([[0., 9., 1.], [2., 0., 7.]], device='cuda')
+    drafts = torch.tensor([1, 1], device='cuda', dtype=torch.int32)
+    cu = torch.tensor([2], device='cuda', dtype=torch.int32)
+    bonus = torch.tensor([[2]], device='cuda', dtype=torch.int32)
+    expected = [[1, 2, -1]]
+    for beta, gamma, aux in ((-99., -10., torch.full_like(target, -1e4)),
+                             (99., 1e6, torch.full_like(target, 1e4))):
+        with patch.dict(os.environ, {'ASYMSPEC_METHOD': 'strict_target',
+                                     'ASYMSPEC_DELTA_SRC': 'scd'}):
+            out = specsteer_greedy_sample(drafts, [2], 2, cu, target,
+                aux, -aux, bonus, beta=beta, gamma=gamma)
+        assert out.cpu().tolist() == expected
+    print(f'PASS: {checked} sampler reference cases, strict-threshold equality, '
+          'and strict-target isolation')
 
 
 if __name__ == '__main__':
