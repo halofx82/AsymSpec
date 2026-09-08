@@ -1,0 +1,22 @@
+[
+  {
+    "id": "story-50",
+    "max_tokens": 160,
+    "messages": [{"role": "user", "content": "Write a coherent short story of exactly 50 words.\nDo not count the words aloud, do not show your work, and do not\nmention the word count. Output only the story."}]
+  },
+  {
+    "id": "coding-debugging",
+    "max_tokens": 512,
+    "messages": [{"role": "user", "content": "Fix this Python function. It is intended to return the length of the\nlongest substring containing no repeated characters, but it is wrong:\n\ndef longest_unique(s):\n    seen = set()\n    left = 0\n    best = 0\n    for right, ch in enumerate(s):\n        if ch in seen:\n            seen.remove(s[left])\n            left += 1\n        seen.add(ch)\n        best = max(best, right - left + 1)\n    return best\n\nExplain the bug briefly, then give the corrected function.\nYour solution must run in O(n) time."}]
+  },
+  {
+    "id": "reasoning-pen",
+    "max_tokens": 384,
+    "messages": [{"role": "user", "content": "A farmer has 100 meters of fencing and wants to build a rectangular pen\nagainst a perfectly straight river, so no fence is needed along the river.\nWhat dimensions maximize the enclosed area?\n\nDerive the answer. Then give only the final dimensions and maximum area on\nthe last line."}]
+  },
+  {
+    "id": "backup-constraints",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Write exactly four bullet points about database backups.\n\nRequirements:\n- Every bullet must begin with a different verb.\n- Each bullet must contain exactly one semicolon.\n- The word \"backup\" may appear exactly twice in the entire response.\n- Do not use numbered lists.\n- Do not add an introduction or conclusion."}]
+  }
+]
