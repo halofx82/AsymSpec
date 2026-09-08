@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -140,8 +141,12 @@ class KVCacheManager:
         if max_in_flight_tokens is None:
             max_in_flight_tokens = max_model_len
 
-        if any(any("specsteer_base." in n for n in g.layer_names)
-               for g in kv_cache_config.kv_cache_groups):
+        if (any(any("specsteer_base." in n for n in g.layer_names)
+                for g in kv_cache_config.kv_cache_groups)
+                or (os.environ.get("ASYMSPEC_METHOD", "").lower()
+                    == "strict_target" and any(
+                        any("draft_model." in n for n in g.layer_names)
+                        for g in kv_cache_config.kv_cache_groups))):
             enable_caching = False
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events

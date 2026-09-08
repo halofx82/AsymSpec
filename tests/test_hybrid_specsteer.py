@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import pathlib
 import unittest
 
@@ -44,6 +45,37 @@ class HybridSpecSteerTests(unittest.TestCase):
         hybrid.require_distinct_runtime_layer_sets(draft, base)
         with self.assertRaises(RuntimeError):
             hybrid.require_distinct_runtime_layer_sets(draft, draft)
+
+    def test_strict_target_accepts_drafter_only_topology(self):
+        draft = {
+            "draft_model.model.layers.0.linear_attn",
+            "draft_model.model.layers.3.self_attn",
+        }
+        verifier = {
+            "model.layers.0.linear_attn",
+            "model.layers.3.self_attn",
+        }
+        hybrid.require_strict_target_runtime_layer_set(draft, draft | verifier)
+        with self.assertRaises(RuntimeError):
+            hybrid.require_strict_target_runtime_layer_set(
+                draft, draft | verifier | {"specsteer_base.model.layers.0.linear_attn"})
+
+    def test_strict_target_mode_is_explicit(self):
+        previous = os.environ.get("ASYMSPEC_METHOD")
+        try:
+            os.environ["ASYMSPEC_METHOD"] = "strict_target"
+            self.assertTrue(hybrid.is_strict_target_mode())
+            os.environ["ASYMSPEC_METHOD"] = "jsd"
+            self.assertFalse(hybrid.is_strict_target_mode())
+        finally:
+            if previous is None:
+                os.environ.pop("ASYMSPEC_METHOD", None)
+            else:
+                os.environ["ASYMSPEC_METHOD"] = previous
+
+    def test_strict_target_has_no_compressed_base_but_jsd_keeps_one(self):
+        self.assertFalse(hybrid.uses_compressed_base(True))
+        self.assertTrue(hybrid.uses_compressed_base(False))
 
     def test_text_mrope_shape(self):
         try:

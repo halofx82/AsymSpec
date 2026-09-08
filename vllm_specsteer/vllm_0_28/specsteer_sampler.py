@@ -40,8 +40,8 @@ def specsteer_greedy_sample(
     max_spec_len: int,
     cu_num_draft_tokens: torch.Tensor,
     target_logits: torch.Tensor,
-    aug_logits: torch.Tensor,
-    base_logits: torch.Tensor,
+    aug_logits: torch.Tensor | None,
+    base_logits: torch.Tensor | None,
     bonus_token_ids: torch.Tensor,
     beta: float = 1.0,
     gamma: float = 0.5,
@@ -63,8 +63,7 @@ def specsteer_greedy_sample(
                       "cma_hbase", "strict_target"}, method
 
     assert draft_token_ids.ndim == 1
-    assert target_logits.ndim == aug_logits.ndim == base_logits.ndim == 2
-    assert target_logits.shape == aug_logits.shape == base_logits.shape
+    assert target_logits.ndim == 2
     batch_size = len(num_draft_tokens)
     num_tokens, vocab_size = target_logits.shape
     device = target_logits.device
@@ -94,6 +93,10 @@ def specsteer_greedy_sample(
                             num_draft_tokens, cu_num_draft_tokens,
                             bonus_token_ids)
         return output_token_ids
+
+    assert aug_logits is not None and base_logits is not None
+    assert target_logits.ndim == aug_logits.ndim == base_logits.ndim == 2
+    assert target_logits.shape == aug_logits.shape == base_logits.shape
 
     # Work in fp32; kernels are memory-bound.
     t_log = torch.log_softmax(target_logits.float(), dim=-1)

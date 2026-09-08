@@ -33,7 +33,12 @@ def load_messages(path: Path) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("target", "strict-target"), required=True)
+    parser.add_argument(
+        "--mode", choices=("target", "strict-target", "jsd", "draft"),
+        required=True,
+        help="target=27B, strict-target=target-authoritative SpecSteer, "
+             "jsd=three-path SpecSteer, draft=standalone 4B",
+    )
     parser.add_argument("--messages", type=Path, required=True,
                         help="JSON array passed unchanged to the Qwen chat template")
     parser.add_argument("--out", type=Path, required=True)
@@ -52,11 +57,14 @@ def main() -> None:
 
     # The strict run deliberately uses the same rendered prompt on both paths:
     # this isolates target verification from context-compression differences.
+    is_specsteer = args.mode in {"strict-target", "jsd"}
     if args.mode == "strict-target":
         os.environ["ASYMSPEC_METHOD"] = "strict_target"
+    elif args.mode == "jsd":
+        os.environ["ASYMSPEC_METHOD"] = "jsd"
 
     common = dict(
-        model=VERIFIER,
+        model=DRAFTER if args.mode == "draft" else VERIFIER,
         # The Python LLM API has no ``language_model_only`` keyword in vLLM
         # 0.28. ``generate`` selects the text-generation runner; no image
         # inputs are supplied by this text-only capture helper.
@@ -68,7 +76,7 @@ def main() -> None:
         enable_prefix_caching=False,
         enforce_eager=True,
     )
-    if args.mode == "strict-target":
+    if is_specsteer:
         llm = LLM(
             **common,
             speculative_config={
@@ -89,12 +97,12 @@ def main() -> None:
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True)
     prompt_ids = list(tokenizer.encode(prompt, add_special_tokens=False))
-    if (args.mode == "strict-target"
+    if (is_specsteer
             and len(prompt_ids) + args.max_tokens + args.num_speculative_tokens
             > args.main_max_model_len):
         parser.error("prompt + completion + K exceeds --main-max-model-len")
     sampling_kwargs = {"temperature": 0, "max_tokens": args.max_tokens}
-    if args.mode == "strict-target":
+    if is_specsteer:
         sampling_kwargs["extra_args"] = {"specsteer_aug_prompt_ids": prompt_ids}
     result = llm.generate(
         [{"prompt_token_ids": prompt_ids}],

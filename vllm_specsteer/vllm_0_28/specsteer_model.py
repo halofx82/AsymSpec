@@ -32,9 +32,12 @@ from vllm.logger import init_logger
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.hybrid_specsteer import (
     is_hybrid_model_config,
+    is_strict_target_mode,
     require_distinct_runtime_layer_sets,
+    require_strict_target_runtime_layer_set,
     split_hybrid_layer_names,
     text_mrope_positions,
+    uses_compressed_base,
 )
 
 logger = init_logger(__name__)
@@ -164,6 +167,9 @@ class SpecSteerProposer(DraftModelProposer):
         # Install KV-cache-group split patch BEFORE super (which may allocate
         # KV cache during load_model later). Idempotent.
         _install_drafter_gid_split_patch()
+        # Must be available while the parent invokes _get_model().  Strict
+        # target has no compressed 4B view at all, rather than a dormant one.
+        self._strict_target_mode = is_strict_target_mode()
         super().__init__(vllm_config=vllm_config, device=device, runner=runner)
         self.runner = runner  # parent doesn't store it
         # The parent only allocates self.positions for non-M-RoPE
@@ -200,7 +206,8 @@ class SpecSteerProposer(DraftModelProposer):
         # itself; we hook there to also initialize the base instance).
         self.base_model: nn.Module | None = None
         self._base_attn_layer_names: set[str] | None = None
-        self._hybrid_specsteer = False
+        self._hybrid_specsteer = is_hybrid_model_config(
+            self._create_draft_vllm_config().model_config)
         self._base_full_attn_layer_names: set[str] = set()
         self._base_gdn_layer_names: set[str] = set()
         self._draft_full_attn_layer_names: set[str] = set()
@@ -247,12 +254,14 @@ class SpecSteerProposer(DraftModelProposer):
         self._prof_cache_misses = 0
         self._prof_cache_skipped_tokens = 0
 
-        # T1: pre-allocated buffers for fast base PV path. Pure-attention
+        # T1: pre-allocated buffers for fast base PV path. Strict target never
+        # uses them; retain tiny placeholders so legacy helper attributes stay
+        # well-defined without allocating the former large base staging area.
         # models use the legacy K+2 warmup rewrite. Hybrid GDN metadata has a
         # native speculative layout of exactly K+1 tokens, so it must start at
         # the first uncomputed position instead.
         K = getattr(self, "num_speculative_tokens", 2) or 2
-        max_bs = 256
+        max_bs = 1 if self._strict_target_mode else 256
         tpr = K + (1 if self._hybrid_specsteer else 2)
         total = max_bs * tpr
         self._base_pv_max_bs = max_bs
@@ -311,7 +320,8 @@ class SpecSteerProposer(DraftModelProposer):
         self._use_fast_base_fwd = True
 
         logger.info(
-            "SpecSteerProposer initialized: β=%.2f γ=%.2f (profile=%s)",
+            "SpecSteerProposer initialized: mode=%s β=%.2f γ=%.2f (profile=%s)",
+            "strict_target" if self._strict_target_mode else "contrast",
             self.beta, self.gamma, self._profile_enabled,
         )
 
@@ -447,26 +457,28 @@ class SpecSteerProposer(DraftModelProposer):
             )
         after_drafter_attn = set(self._all_attn_layer_names())
 
-        # 2. Base — construct the same architecture without touching the
-        # checkpoint or allocating a second set of model weights.
-        with set_model_tag("specsteer_base"):
-            with set_default_torch_dtype(draft_vllm_config.model_config.dtype):
-                with torch.device("meta"):
-                    self.base_model = initialize_model(
-                        vllm_config=draft_vllm_config,
-                        model_config=draft_vllm_config.model_config,
-                        prefix="specsteer_base",
-                    )
-        shared_bytes, shared_buffer_bytes = _share_model_state(
-            drafter, self.base_model)
-        self.base_model.eval()
-        logger.info(
-            "AsymSpec: base view structurally initialized without checkpoint "
-            "I/O; sharing %.2f GiB parameters and %.2f MiB buffers",
-            shared_bytes / (1024**3),
-            shared_buffer_bytes / (1024**2),
-        )
-        after_base_attn = set(self._all_attn_layer_names())
+        after_base_attn = after_drafter_attn
+        if uses_compressed_base(self._strict_target_mode):
+            # 2. Base — construct the same architecture without touching the
+            # checkpoint or allocating a second set of model weights.
+            with set_model_tag("specsteer_base"):
+                with set_default_torch_dtype(draft_vllm_config.model_config.dtype):
+                    with torch.device("meta"):
+                        self.base_model = initialize_model(
+                            vllm_config=draft_vllm_config,
+                            model_config=draft_vllm_config.model_config,
+                            prefix="specsteer_base",
+                        )
+            shared_bytes, shared_buffer_bytes = _share_model_state(
+                drafter, self.base_model)
+            self.base_model.eval()
+            logger.info(
+                "AsymSpec: base view structurally initialized without checkpoint "
+                "I/O; sharing %.2f GiB parameters and %.2f MiB buffers",
+                shared_bytes / (1024**3),
+                shared_buffer_bytes / (1024**2),
+            )
+            after_base_attn = set(self._all_attn_layer_names())
 
         # Attn-layer bookkeeping: new layers introduced by each load.
         drafter_new_layers = after_drafter_attn - pre_attn
@@ -481,7 +493,11 @@ class SpecSteerProposer(DraftModelProposer):
             base_names = {
                 name for name in base_new_layers if "specsteer_base." in name
             }
-            require_distinct_runtime_layer_sets(draft_names, base_names)
+            if self._strict_target_mode:
+                require_strict_target_runtime_layer_set(
+                    draft_names, after_base_attn)
+            else:
+                require_distinct_runtime_layer_sets(draft_names, base_names)
             (self._draft_full_attn_layer_names,
              self._draft_gdn_layer_names) = split_hybrid_layer_names(draft_names)
             (self._base_full_attn_layer_names,
@@ -494,10 +510,18 @@ class SpecSteerProposer(DraftModelProposer):
                 len(self._base_full_attn_layer_names),
                 len(self._base_gdn_layer_names),
             )
-        logger.info(
-            "SpecSteer: loaded drafter (%d attn layers) + base (%d attn layers)",
-            len(drafter_new_layers), len(base_new_layers),
-        )
+        if self._strict_target_mode:
+            if any(name.startswith("specsteer_base.")
+                   for name in after_base_attn):
+                raise RuntimeError("Strict-target must not construct specsteer_base")
+            logger.info(
+                "SpecSteer strict-target: full drafter=%d layers; "
+                "compressed base disabled", len(drafter_new_layers))
+        else:
+            logger.info(
+                "SpecSteer: loaded drafter (%d attn layers) + base (%d attn layers)",
+                len(drafter_new_layers), len(base_new_layers),
+            )
         return drafter
 
     def invalidate_requests(self, request_ids):
@@ -770,10 +794,15 @@ class SpecSteerProposer(DraftModelProposer):
         self.base_kv_cache_gid = base_gid
         self.drafter_kv_cache_gids = {gid for gid, _ in draft_groups}
         self.base_kv_cache_gids = {gid for gid, _ in base_groups}
-        if self._hybrid_specsteer and (len(draft_groups) < 2 or len(base_groups) < 2):
+        if self._hybrid_specsteer and len(draft_groups) < 2:
             raise RuntimeError(
                 "Hybrid SpecSteer requires independent full-attention and "
-                "GDN cache groups for both 4B views")
+                "GDN cache groups for the full drafter")
+        if (self._hybrid_specsteer and not self._strict_target_mode
+                and len(base_groups) < 2):
+            raise RuntimeError(
+                "Hybrid contrast SpecSteer requires independent full-attention "
+                "and GDN cache groups for the compressed base")
 
         def _build_groups(layer_set, located_groups):
             if not layer_set or not located_groups:
@@ -810,6 +839,11 @@ class SpecSteerProposer(DraftModelProposer):
         self.draft_attn_groups = _build_groups(drafter_set, draft_groups)
         self.base_attn_groups = _build_groups(base_set, base_groups)
 
+        if self._strict_target_mode:
+            if base_set or base_groups or self.base_attn_groups:
+                raise RuntimeError(
+                    "Strict-target allocated compressed-base cache groups")
+
         if self.draft_attn_groups:
             self.block_size = (
                 self.draft_attn_groups[0].get_metadata_builder()
@@ -819,11 +853,27 @@ class SpecSteerProposer(DraftModelProposer):
             self.block_size = kernel_block_sizes[drafter_gid]
 
 
-        logger.info(
-            "AsymSpec: drafter_gid=%d (%d layers) + base_gid=%d "
-            "(%d layers). Separate block tables will be used.",
-            drafter_gid, len(drafter_set), base_gid, len(base_set),
-        )
+        if self._strict_target_mode:
+            logger.info(
+                "SpecSteer strict-target cache: drafter gids=%s (%d layers); "
+                "compressed-base cache disabled",
+                sorted(self.drafter_kv_cache_gids), len(drafter_set))
+            main_limit = getattr(self.speculative_config,
+                                 "specsteer_main_max_model_len", None)
+            full_limit = self.vllm_config.model_config.max_model_len
+            logger.info(
+                "SpecSteer strict-target: full drafter=%s; verifier=%s; "
+                "compressed base=disabled; full context limit=%d; "
+                "verifier context limit=%d",
+                self.speculative_config.model,
+                self.vllm_config.model_config.model,
+                full_limit, main_limit or full_limit)
+        else:
+            logger.info(
+                "AsymSpec: drafter_gid=%d (%d layers) + base_gid=%d "
+                "(%d layers). Separate block tables will be used.",
+                drafter_gid, len(drafter_set), base_gid, len(base_set),
+            )
 
         # The obsolete dual-forward path is disabled. Keep the original
         # drafter forward for _compute_aug_first_bonus.
@@ -2591,10 +2641,17 @@ class SpecSteerProposer(DraftModelProposer):
             if draft_token_ids is None:
                 raise RuntimeError("Hybrid SpecSteer drafter rebuild failed")
 
+            B, K = draft_token_ids.shape
+            if self._strict_target_mode:
+                # The verifier owns every committed token in strict mode. The
+                # full-context 4B only proposes; no compressed 4B exists and
+                # no delta/base forward may run.
+                self._base_logits_per_pos = []
+                return draft_token_ids
+
             pv_logits = self._base_parallel_verify(
                 draft_token_ids.reshape(-1), next_token_ids=next_token_ids,
             )
-            B, K = draft_token_ids.shape
             if (pv_logits is None or pv_logits.dim() != 3
                     or pv_logits.shape[0] != B or pv_logits.shape[1] < K):
                 raise RuntimeError(

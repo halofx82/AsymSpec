@@ -206,17 +206,31 @@ The same language-only setting is propagated to the 4B draft ModelConfig. The
 full drafter groups use `max_model_len`; compressed verifier/base groups use
 `specsteer_main_max_model_len`. Hybrid prefix caching is rejected explicitly.
 
-#### Verifier strict-target diagnostic
+#### Target-authoritative strict-target mode
 
-Before interpreting hybrid-pair output quality, validate the 27B verifier with
-target-only greedy speculative decoding. It retains 4B proposals for scheduling
-but commits a proposal only when it equals the 27B verifier's top-1 token;
-otherwise it commits that verifier token and stops the speculative block.
+`strict_target` is a supported hybrid serving mode for cases where the 27B
+verifier must have final authority. It retains full-context Qwen3.5-4B
+proposals, but commits a proposal only when it equals the Qwen3.8-27B top-1;
+otherwise it commits the verifier token and stops the speculative block.
+
+Unlike contrast modes such as `jsd`, strict target does not construct the
+compressed `specsteer_base` 4B view. It allocates and executes only the
+full-context drafter and compressed verifier, so it has no base KV/GDN cache,
+base replay, base logits, or delta fusion. Startup logs explicitly report the
+two context limits and `compressed base=disabled`.
 
 ```bash
 export ASYMSPEC_METHOD=strict_target
 export ASYMSPEC_STRICT_DIAG_LOG="$PWD/outputs/strict-target.jsonl"
 ```
+
+For normal OpenAI-compatible serving, use the ordinary server command from the
+previous section with `ASYMSPEC_METHOD=strict_target`; clients do not need an
+AsymSpec field. Every Chat Completions request keeps its full view for the 4B
+drafter and receives the configured recent/compressed view at the verifier.
+The server logs aggregate `target_agreement_rate`, accepted/rejected drafts,
+bonus tokens, target replacements, and mean accepted span every 50 strict
+sampling steps. `ASYMSPEC_STRICT_DIAG_LOG` is optional per-block JSONL detail.
 
 For a text-chat capture, put the same messages in `messages.json`, then run the
 two commands separately (never concurrently):
@@ -256,10 +270,10 @@ request/speculative block without prompt contents, e.g.
 {"method":"strict_target","request_index":0,"num_draft_tokens":2,"num_target_top1_matches":1,"first_mismatch_position":1,"all_drafts_match":false,"bonus_emitted":false,"bonus_token_id":null,"positions":[{"pos":0,"draft":123,"target_top1":123,"match":true,"emitted":123},{"pos":1,"draft":456,"target_top1":789,"match":false,"emitted":789}]}
 ```
 
-An A-vs-B mismatch is evidence to investigate the verifier/cache path; do not
-attribute it to decoded-text differences or to the JSD sampler. Deterministic
-execution settings (V1, eager mode, fixed seed, no concurrent batching) should
-be held constant. The normal `jsd` mode remains a separate quality comparison.
+This capture remains useful for verifier investigations. Deterministic execution
+settings (V1, eager mode, fixed seed, no concurrent batching) should be held
+constant. The normal `jsd` mode remains a separate quality comparison and
+continues to use the compressed 4B base and contrastive delta.
 
 ```bash
 export ASYMSPEC_METHOD=jsd

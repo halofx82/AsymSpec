@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+import os
 from typing import NamedTuple
 
 from vllm import envs
@@ -1165,10 +1166,20 @@ def get_kv_cache_coordinator(
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
 ) -> KVCacheCoordinator:
-    asymspec = any(
+    has_base = any(
         any("specsteer_base." in n for n in g.layer_names)
         for g in kv_cache_config.kv_cache_groups
     )
+    # Strict target intentionally has no base prefix, but it still needs the
+    # AsymSpec coordinator to give the full-context drafter its own token
+    # accounting and independent pool. Restrict this to the explicit mode so
+    # ordinary vLLM draft-model configurations remain untouched.
+    strict_target = (
+        os.environ.get("ASYMSPEC_METHOD", "").lower() == "strict_target"
+        and any(any("draft_model." in n for n in g.layer_names)
+                for g in kv_cache_config.kv_cache_groups)
+    )
+    asymspec = has_base or strict_target
     if not enable_caching or asymspec:
         coordinator_cls = (SpecSteerKVCacheCoordinator if asymspec
                            else KVCacheCoordinatorNoPrefixCache)

@@ -4056,6 +4056,28 @@ class GPUModelRunner(
                 "{'llm', 'none', 'drafter'}"
             )
 
+        strict_target = os.environ.get("ASYMSPEC_METHOD", "gamma_rule") == "strict_target"
+        if strict_target:
+            # Strict target requires only proposal token IDs and verifier
+            # logits.  Do not read a compressed-base result or even materialize
+            # the drafter's vocabulary logits here.
+            output_token_ids = specsteer_greedy_sample(
+                draft_token_ids=metadata.draft_token_ids,
+                num_draft_tokens=metadata.num_draft_tokens,
+                max_spec_len=metadata.max_spec_len,
+                cu_num_draft_tokens=metadata.cu_num_draft_tokens,
+                target_logits=target_logits,
+                aug_logits=None,
+                base_logits=None,
+                bonus_token_ids=bonus_token_ids,
+                beta=0.0,
+                gamma=0.0,
+            )
+            self._update_strict_target_metrics(metadata, target_logits,
+                                                output_token_ids)
+            return SamplerOutput(sampled_token_ids=output_token_ids,
+                                 logprobs_tensors=None)
+
         # Drafter logits: SpecSteerProposer stores per-position [batch, V].
         # Reshape to [num_tokens, V] in the runner's per-request flat order.
         draft_logits_list = self.drafter._draft_logits_per_pos
@@ -4124,6 +4146,48 @@ class GPUModelRunner(
             gamma=self.drafter.gamma,
         )
         return SamplerOutput(sampled_token_ids=output_token_ids, logprobs_tensors=None)
+
+    def _update_strict_target_metrics(self, metadata, target_logits,
+                                      output_token_ids) -> None:
+        """Accumulate target-authoritative agreement without host sync per step."""
+        target_top1 = target_logits.argmax(dim=-1).to(torch.int32)
+        drafts = metadata.draft_token_ids.to(torch.int32)
+        if not hasattr(self, "_strict_target_metrics"):
+            self._strict_target_metrics = torch.zeros(
+                5, dtype=torch.int64, device=target_logits.device)
+            self._strict_target_metric_steps = 0
+        matches = (target_top1 == drafts)
+        # Output positions 0..K contain accepted draft IDs or a replacement.
+        accepted = torch.zeros_like(matches, dtype=torch.int64)
+        start = 0
+        for row, count in enumerate(metadata.num_draft_tokens):
+            accepted[start:start + count] = (
+                output_token_ids[row, :count].to(torch.int32)
+                == drafts[start:start + count]).to(torch.int64)
+            start += count
+        bonus = torch.zeros((), dtype=torch.int64, device=drafts.device)
+        replacements = torch.zeros((), dtype=torch.int64, device=drafts.device)
+        start = 0
+        for row, count in enumerate(metadata.num_draft_tokens):
+            bonus += (output_token_ids[row, count] >= 0).to(torch.int64)
+            replacements += ((output_token_ids[row, :count] >= 0).sum()
+                             - accepted[start:start + count].sum())
+            start += count
+        self._strict_target_metrics += torch.stack((
+            torch.tensor(drafts.numel(), device=drafts.device), matches.sum(),
+            accepted.sum(), bonus, replacements,
+        )).to(torch.int64)
+        self._strict_target_metric_steps += 1
+        if self._strict_target_metric_steps % 50 == 0:
+            total, agree, accepted_count, bonus_count, replacement_count = (
+                int(x) for x in self._strict_target_metrics.cpu().tolist())
+            logger.info(
+                "SpecSteer strict-target metrics: drafted=%d agreement=%d "
+                "accepted=%d rejected=%d agreement_rate=%.4f bonus=%d "
+                "target_replacements=%d mean_accepted_span=%.3f",
+                total, agree, accepted_count, total - accepted_count,
+                agree / max(total, 1), bonus_count, replacement_count,
+                accepted_count / max(self._strict_target_metric_steps, 1))
 
     def _bookkeeping_sync(
         self,

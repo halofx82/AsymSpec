@@ -8,9 +8,25 @@ non-negotiable sharing/isolation checks out of the pure-attention proposer.
 from __future__ import annotations
 
 from collections.abc import Iterable
+import os
 
 
 _AUXILIARY_PREFIXES = ("draft_model.", "specsteer_base.")
+
+
+def is_strict_target_mode() -> bool:
+    """Whether this worker is running target-authoritative SpecSteer.
+
+    This remains environment-selected for compatibility with the existing
+    sampler switch.  It is deliberately a narrow predicate: the normal JSD
+    topology continues to require both 4B views.
+    """
+    return os.environ.get("ASYMSPEC_METHOD", "gamma_rule").lower() == "strict_target"
+
+
+def uses_compressed_base(strict_target: bool) -> bool:
+    """Whether a SpecSteer topology needs the compressed 4B model view."""
+    return not strict_target
 
 
 def is_auxiliary_state_layer(layer_name: str) -> bool:
@@ -48,6 +64,26 @@ def require_distinct_runtime_layer_sets(
             raise RuntimeError(
                 f"Hybrid SpecSteer {label} must contain both self_attn and "
                 "linear_attn layers")
+
+
+def require_strict_target_runtime_layer_set(
+    draft_layer_names: Iterable[str], all_layer_names: Iterable[str],
+) -> None:
+    """Validate strict-target's two-view topology before inference.
+
+    Strict target has a verifier and one full-context drafter.  In
+    particular, a compressed ``specsteer_base`` layer must never have been
+    registered: its presence means it can still consume KV/GDN resources.
+    """
+    draft = set(draft_layer_names)
+    all_names = set(all_layer_names)
+    if any(name.startswith("specsteer_base.") for name in all_names):
+        raise RuntimeError("Strict-target registered specsteer_base runtime layers")
+    full, gdn = split_hybrid_layer_names(draft)
+    if draft and (not full or not gdn):
+        raise RuntimeError(
+            "Hybrid strict-target drafter must contain both self_attn and "
+            "linear_attn layers")
 
 
 def text_mrope_positions(positions):

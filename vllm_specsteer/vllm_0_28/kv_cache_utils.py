@@ -1860,6 +1860,13 @@ def get_kv_cache_groups(vllm_config, kv_cache_spec):
                 if uniform is None:
                     raise ValueError("AsymSpec requires uniform attention within each view")
                 result.extend(_get_kv_cache_groups_uniform_type(uniform))
+    if os.environ.get("ASYMSPEC_METHOD", "").lower() == "strict_target":
+        leaked = [name for group in result for name in group.layer_names
+                  if name.startswith("specsteer_base.")]
+        if leaked:
+            raise RuntimeError(
+                "Strict-target must not allocate compressed-base cache layers: "
+                + repr(leaked[:4]))
     return result
 
 
