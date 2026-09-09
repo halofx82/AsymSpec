@@ -241,9 +241,14 @@ class SpecSteerProposer(DraftModelProposer):
 
         # T_profile: per-segment CUDA event timing (enabled via env var)
         import os as _os
-        self._profile_enabled = _os.environ.get(
-            "SPECSTEER_PROFILE", "0"
-        ) == "1"
+        # ``ASYMSPEC_PROFILE`` is the public switch.  Keep the older name
+        # working for local experiments made before this profiler was wired
+        # into strict-target mode.
+        self._profile_enabled = (
+            _os.environ.get("ASYMSPEC_PROFILE",
+                            _os.environ.get("SPECSTEER_PROFILE", "0"))
+            == "1"
+        )
         self._prof_events: dict[str, list] = {}
         self._prof_step = 0
         self._prof_report_every = int(_os.environ.get(
@@ -253,6 +258,8 @@ class SpecSteerProposer(DraftModelProposer):
         self._prof_cache_hits = 0
         self._prof_cache_misses = 0
         self._prof_cache_skipped_tokens = 0
+        self._prof_steps: list[dict] = []
+        self._prof_path = _os.environ.get("ASYMSPEC_PROFILE_FILE")
 
         # T1: pre-allocated buffers for fast base PV path. Strict target never
         # uses them; retain tiny placeholders so legacy helper attributes stay
@@ -373,8 +380,30 @@ class SpecSteerProposer(DraftModelProposer):
             self._prof_cache_hits, self._prof_cache_misses,
             cache_hit_rate, avg_skip,
         )
+        if self._prof_path and self._prof_steps:
+            # Every TP worker sees the same request.  Keep a single artifact
+            # without adding a distributed synchronization to the hot path.
+            is_rank_zero = (not torch.distributed.is_initialized()
+                            or torch.distributed.get_rank() == 0)
+            if is_rank_zero:
+                import json
+                from pathlib import Path
+                path = Path(self._prof_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    for record in self._prof_steps:
+                        events = record.pop("_events")
+                        (start, replay_end, proposal_start, proposal_end, end,
+                         target_start, target_end, sampler_start, sampler_end) = events
+                        record["replay_ms"] = start.elapsed_time(replay_end)
+                        record["proposal_ms"] = proposal_start.elapsed_time(proposal_end)
+                        record["drafter_postprocess_ms"] = proposal_end.elapsed_time(end)
+                        record["verifier_ms"] = target_start.elapsed_time(target_end)
+                        record["sampler_ms"] = sampler_start.elapsed_time(sampler_end)
+                        f.write(json.dumps(record, sort_keys=True) + "\n")
         # Reset windows
         self._prof_events = {}
+        self._prof_steps = []
         self._prof_cache_hits = 0
         self._prof_cache_misses = 0
         self._prof_cache_skipped_tokens = 0
@@ -1583,7 +1612,7 @@ class SpecSteerProposer(DraftModelProposer):
         if next_token_ids.numel() < input_batch.num_reqs:
             raise RuntimeError("Hybrid SpecSteer is missing verifier next_token_ids")
 
-        # === PROFILING: per-phase CUDA events (driven by SPECSTEER_PROFILE) ===
+        # === PROFILING: per-phase CUDA events (buffered; no per-step sync) ===
         _PROF = self._profile_enabled
         prof_evts: list[tuple[str, "torch.cuda.Event"]] = []
         if _PROF:
@@ -1780,7 +1809,7 @@ class SpecSteerProposer(DraftModelProposer):
         ]
         slot_mapping_dict = {n: slot_mapping_prefill for n in drafter_layers}
 
-        if _PROF: prof_evts.append(("prefill_setup_done", self._profile_event()))
+        if _PROF: prof_evts.append(("rebuild_setup_done", self._profile_event()))
         # Compute multimodal embeddings for the prefill stage when present.
         _vlmm_embeds = self._vlmm_compute_aug_inputs_embeds(valid, all_input_ids)
         if getattr(self, "uses_mrope", False):
@@ -1803,7 +1832,7 @@ class SpecSteerProposer(DraftModelProposer):
                     input_ids=all_input_ids, positions=all_positions, inputs_embeds=None,
                 )
             dh = ret[0] if isinstance(ret, tuple) else ret
-        if _PROF: prof_evts.append(("prefill_forward_done", self._profile_event()))
+        if _PROF: prof_evts.append(("rebuild_forward_done", self._profile_event()))
 
         # The last committed verifier token predicts draft position zero.
         last_indices = torch.tensor(
@@ -1823,7 +1852,7 @@ class SpecSteerProposer(DraftModelProposer):
                 self._aug_prefilled[rid] = (
                     len(aug_ids), hash(tuple(aug_ids)),
                 )
-        if _PROF: prof_evts.append(("prefill_bonus_done", self._profile_event()))
+        if _PROF: prof_evts.append(("proposal_start", self._profile_event()))
         # The prefill produces draft zero.  Only later draft positions need a
         # one-token decode.  Keep GDN on the committed-prefix state block
         # throughout this inner loop; the outer round always re-prefills it.
@@ -1944,7 +1973,7 @@ class SpecSteerProposer(DraftModelProposer):
             draft_token_ids_list.append(new_drafts)
             last_tokens = new_drafts
 
-        if _PROF: prof_evts.append(("kdec_done", self._profile_event()))
+        if _PROF: prof_evts.append(("proposal_done", self._profile_event()))
 
         # Stack: (K, N_valid) → transpose to (N_valid, K)
         draft_per_req_K = torch.stack(draft_token_ids_list, dim=0).t()
@@ -1956,21 +1985,49 @@ class SpecSteerProposer(DraftModelProposer):
             draft_full[slot] = draft_per_req_K[j].to(torch.int32)
 
         if _PROF:
+            # A profile window synchronizes only in _prof_report_if_due().
+            # Keep CUDA events, plus CPU-side work counts, until then.
             prof_evts.append(("end", self._profile_event()))
-            torch.cuda.synchronize()
-            # Compute deltas in ms
-            delta_str = []
-            base_ev = prof_evts[0][1]
-            prev_ev = base_ev
-            for label, ev in prof_evts[1:]:
-                d_prev = prev_ev.elapsed_time(ev)  # ms
-                d_total = base_ev.elapsed_time(ev)
-                delta_str.append(f"{label}={d_prev:.1f}(+{d_total:.1f})")
-                prev_ev = ev
-            logger.info(
-                "ASYMSPEC PROF L=%d K=%d N=%d: %s",
-                max_L, K, len(valid), " ".join(delta_str),
+            event_by_name = dict(prof_evts)
+            start = event_by_name["start"]
+            replay_end = event_by_name["rebuild_forward_done"]
+            proposal_start = event_by_name["proposal_start"]
+            proposal_end = event_by_name["proposal_done"]
+            end = event_by_name["end"]
+            # The target forward and strict sampler immediately precede this
+            # proposal round.  They are recorded by GPUModelRunner; retain
+            # their already-complete event pairs to make a logical outer-step
+            # record without forcing a device synchronization here.
+            target_pair = self._prof_events.get("verifier_forward", [])[-1]
+            sampler_pair = self._prof_events.get("strict_sampler", [])[-1]
+            def pair(name, first, second):
+                self._prof_events.setdefault(name, []).append([first, second])
+            pair("drafter_rebuild", start, replay_end)
+            pair("drafter_proposal", proposal_start, proposal_end)
+            pair("drafter_postprocess", proposal_end, end)
+            committed_lengths = [int(input_batch.num_tokens_no_spec[r])
+                                 for _, r, _ in valid]
+            main_prompt_lengths = [int(input_batch.num_prompt_tokens_cpu_tensor[r])
+                                   for _, r, _ in valid]
+            repeated = sum(
+                L for L, committed, prompt in zip(Ls, committed_lengths,
+                                                   main_prompt_lengths)
+                if committed > prompt
             )
+            self._prof_steps.append({
+                "kind": "drafter_step",
+                "step": self._prof_step + 1,
+                "requests": len(valid),
+                "K": K,
+                "committed_length_before": max(committed_lengths),
+                "initial_prefill_tokens": sum(Ls) if repeated == 0 else 0,
+                "replayed_history_tokens": repeated,
+                "drafter_new_tokens": len(valid) * K,
+                # Events are resolved when the window is flushed.
+                "_events": [start, replay_end, proposal_start, proposal_end, end,
+                            target_pair[0], target_pair[1],
+                            sampler_pair[0], sampler_pair[1]],
+            })
 
         return draft_full
 
@@ -2647,6 +2704,7 @@ class SpecSteerProposer(DraftModelProposer):
                 # full-context 4B only proposes; no compressed 4B exists and
                 # no delta/base forward may run.
                 self._base_logits_per_pos = []
+                self._prof_report_if_due()
                 return draft_token_ids
 
             pv_logits = self._base_parallel_verify(

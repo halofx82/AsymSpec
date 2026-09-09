@@ -92,11 +92,25 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=40960)
     parser.add_argument("--main-max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.97)
+    parser.add_argument("--profile-file", type=Path,
+                        help="strict-target only: JSONL path written by the buffered "
+                             "AsymSpec CUDA-event profiler")
+    parser.add_argument("--full-context-tokens", type=int,
+                        help="synthetic full-view length. For strict-target the "
+                             "verifier keeps the normal prompt while the drafter "
+                             "receives a deterministic repeated-token prefix; for "
+                             "target it is the engine prompt length.")
+    parser.add_argument("--ignore-eos", action="store_true",
+                        help="continue to --max-tokens for deterministic profiling")
     args = parser.parse_args()
     if args.max_tokens <= 0:
         parser.error("--max-tokens must be positive")
     if args.num_speculative_tokens <= 0:
         parser.error("--num-speculative-tokens must be positive")
+    if args.full_context_tokens is not None and args.full_context_tokens <= 0:
+        parser.error("--full-context-tokens must be positive")
+    if args.profile_file and args.mode != "strict-target":
+        parser.error("--profile-file is supported only for --mode strict-target")
 
     # The strict run deliberately uses the same rendered prompt on both paths:
     # this isolates target verification from context-compression differences.
@@ -105,6 +119,9 @@ def main() -> None:
         os.environ["ASYMSPEC_METHOD"] = "strict_target"
     elif args.mode == "jsd":
         os.environ["ASYMSPEC_METHOD"] = "jsd"
+    if args.profile_file:
+        os.environ["ASYMSPEC_PROFILE"] = "1"
+        os.environ["ASYMSPEC_PROFILE_FILE"] = str(args.profile_file)
 
     common = dict(
         model=DRAFTER if args.mode == "draft" else VERIFIER,
@@ -148,18 +165,32 @@ def main() -> None:
     for case in cases:
         max_tokens = case.get("max_tokens", args.max_tokens)
         prompt_ids = render_prompt_ids(tokenizer, case["messages"], chat_template)
+        full_prompt_ids = prompt_ids
+        if args.full_context_tokens is not None:
+            if args.full_context_tokens < len(prompt_ids):
+                parser.error(f"case {case['id']!r}: --full-context-tokens is "
+                             "shorter than the rendered prompt")
+            # A stable ordinary text token gives a reproducible long-context
+            # workload without involving an external prompt generator.
+            filler = tokenizer.encode(" the", add_special_tokens=False)
+            if len(filler) != 1:
+                raise RuntimeError("expected Qwen tokenizer to encode ' the' as one token")
+            full_prompt_ids = ([filler[0]] *
+                               (args.full_context_tokens - len(prompt_ids)) + prompt_ids)
         if (is_specsteer and len(prompt_ids) + max_tokens
                 + args.num_speculative_tokens > args.main_max_model_len):
             parser.error(f"case {case['id']!r}: prompt + completion + K exceeds "
                          "--main-max-model-len")
         sampling_kwargs = {"temperature": 0, "max_tokens": max_tokens,
-                           "seed": 0}
+                           "seed": 0, "ignore_eos": args.ignore_eos}
         if is_specsteer:
             sampling_kwargs["extra_args"] = {
-                "specsteer_aug_prompt_ids": prompt_ids}
+                "specsteer_aug_prompt_ids": full_prompt_ids}
         started = time.perf_counter()
         result = llm.generate(
-            [{"prompt_token_ids": prompt_ids}],
+            [{"prompt_token_ids": (full_prompt_ids if args.mode == "target"
+                                   and args.full_context_tokens is not None
+                                  else prompt_ids)}],
             SamplingParams(**sampling_kwargs),
             use_tqdm=False,
         )[0]
@@ -169,6 +200,7 @@ def main() -> None:
         results.append({
             "id": case["id"],
             "prompt_token_ids": prompt_ids,
+            "full_prompt_token_ids": full_prompt_ids,
             "prompt_sha256": hashlib.sha256(
                 json.dumps(prompt_ids, separators=(",", ":")).encode()).hexdigest(),
             "generated_token_ids": output_ids,
@@ -185,6 +217,8 @@ def main() -> None:
         "enable_thinking": False,
         "chat_template_source": VERIFIER,
         "num_speculative_tokens": args.num_speculative_tokens if is_specsteer else None,
+        "full_context_tokens": args.full_context_tokens,
+        "ignore_eos": args.ignore_eos,
         "cases": results,
     }
     if not args.suite:

@@ -4959,6 +4959,11 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
+        _asymspec_prof_target = None
+        if (self.speculative_config is not None
+                and self.speculative_config.method == "specsteer"
+                and getattr(self.drafter, "_strict_target_mode", False)):
+            _asymspec_prof_target = self.drafter._prof_start("verifier_forward")
         with (
             set_forward_context(
                 attn_metadata,
@@ -4984,6 +4989,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if _asymspec_prof_target is not None:
+            self.drafter._prof_end(_asymspec_prof_target)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5115,8 +5122,15 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        _asymspec_prof_sampler = None
+        if (self.speculative_config is not None
+                and self.speculative_config.method == "specsteer"
+                and getattr(self.drafter, "_strict_target_mode", False)):
+            _asymspec_prof_sampler = self.drafter._prof_start("strict_sampler")
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if _asymspec_prof_sampler is not None:
+            self.drafter._prof_end(_asymspec_prof_sampler)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
